@@ -8,6 +8,7 @@ import argparse
 import http.server
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -22,6 +23,7 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument('--cli', required=True)
+parser.add_argument('--bridge', type=Path, default=ROOT/'target/debug/claude-messages-bridge')
 args = parser.parse_args()
 seen = []
 access = 'sk-ant-oat01-local-rpc-access'
@@ -101,7 +103,7 @@ with tempfile.TemporaryDirectory(prefix='bridge-real-auth-rpc-') as directory:
         with urlopen(request,timeout=45) as response:return json.load(response)
     def launch():
         global child
-        child=subprocess.Popen([str(ROOT/'target/debug/claude-messages-bridge')],cwd=ROOT,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+        child=subprocess.Popen([str(args.bridge.resolve())],cwd=ROOT,env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         deadline=time.monotonic()+10
         while time.monotonic()<deadline:
             if child.poll() is not None:raise AssertionError('Bridge exited during startup')
@@ -130,15 +132,37 @@ with tempfile.TemporaryDirectory(prefix='bridge-real-auth-rpc-') as directory:
         while api('/api/admin/status')['service']['available_slots']==0:time.sleep(.05)
         if expected=='succeeded':assert api('/api/admin/status')['account']['logged_in']
         else:assert 'bound to another account' in current['message']
-    def message():
-        result=api('/v1/messages',{'model':'claude-sonnet-4-6','max_tokens':128,'messages':[{'role':'user','content':'hello'}]})
+    def message(system="RPC_SYSTEM_A", history=None):
+        result=api('/v1/messages',{'model':'claude-sonnet-4-6','max_tokens':128,'system':system,'messages':history or [{'role':'user','content':'hello'}]})
         assert result['content'][0]['text']=='native OAuth RPC works'
         while api('/api/admin/status')['service']['available_slots']<4:time.sleep(.05)
+        return next(payload for path,payload,_ in reversed(seen) if path=='/v1/messages')
+    def prompt_check(upstream, expected):
+        texts=[block['text'] for block in upstream['system'] if block['type']=='text']
+        headers=[text for text in texts if text.startswith('x-anthropic-billing-header:')]
+        identities=[text for text in texts if text.startswith('You are Claude Code,') or text.startswith('You are a Claude agent,')]
+        assert len(headers)==1 and len(identities)==1, texts
+        assert re.search(r'cch=[0-9a-f]{5};',headers[0]),headers
+        assert 'cch=00000;' not in headers[0] and 'cc_version=0.0.0.' not in headers[0], headers
+        assert expected in texts, texts
+        return [{'type':'text','text':text} for text in texts]
+
     try:
         launch();login('claudeai','ok');print('PASS real CLI native authenticate/callback RPC, PKCE, profile and redb save',flush=True)
         assert api('/api/admin/status')['account']['binding']['account_id']==account_id
         login('claudeai','other',expected='failed')
-        message()
+        upstream=message()
+        wrapped=prompt_check(upstream,'RPC_SYSTEM_A')
+        # Replay a caller-supplied CLI wrapper with a changed body and stale cch.
+        for block in wrapped:
+            if block['text'].startswith('x-anthropic-billing-header:'):
+                block['text']='x-anthropic-billing-header: cc_version=0.0.0.abc; cc_entrypoint=sdk-cli; cch=00000;'
+            elif block['text']=='RPC_SYSTEM_A':block['text']='RPC_SYSTEM_B'
+        history=[{'role':'user','content':'first turn'},{'role':'assistant','content':'earlier answer'},{'role':'user','content':'next turn'}]
+        changed=message(wrapped,history)
+        prompt_check(changed,'RPC_SYSTEM_B')
+        assert all('RPC_SYSTEM_A' not in block.get('text','') for block in changed['system'])
+        print('PASS changed system prompt, native prefix/cch injection and stale wrapper removal',flush=True)
         refreshes=sum(path=='/v1/oauth/token' and payload.get('grant_type')=='refresh_token' for path,payload,_ in seen)
         assert refreshes>=1
         print('PASS real CLI native refresh and Messages inference',flush=True)

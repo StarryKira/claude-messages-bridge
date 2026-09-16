@@ -16,6 +16,11 @@ def receive():
 def event(value): emit({'type':'stream_event','parent_tool_use_id':None,'event':value})
 init = receive()
 assert init['request']['subtype'] == 'initialize'
+if 'systemPrompt' in init['request']:
+    assert init['request']['systemPromptSnapshot'] is False
+    assert os.environ['CLAUDE_CODE_ATTRIBUTION_HEADER']=='1'
+    if expected := os.environ.get('FAKE_EXPECT_SYSTEM'):
+        assert init['request']['systemPrompt']==json.loads(expected)
 if mode == 'managed':
     assert 'CLAUDE_CODE_OAUTH_TOKEN' not in os.environ
     cache=Path(os.environ['CLAUDE_CONFIG_DIR']) / '.credentials.json'

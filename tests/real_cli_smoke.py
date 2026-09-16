@@ -78,9 +78,12 @@ class FakeApi(BaseHTTPRequestHandler):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--cli',required=True)
+    parser.add_argument('--bridge',type=Path)
     args=parser.parse_args()
     cli=str(Path(args.cli).expanduser().resolve())
-    subprocess.run(['cargo','build','--locked'],cwd=ROOT,check=True)
+    if args.bridge is None:
+        subprocess.run(['cargo','build','--locked'],cwd=ROOT,check=True)
+    binary=(args.bridge or ROOT/'target/debug/claude-messages-bridge').resolve()
     version=subprocess.check_output([cli,'--version'],text=True).strip()
     fake=ThreadingHTTPServer(('127.0.0.1',0),FakeApi)
     threading.Thread(target=fake.serve_forever,daemon=True).start()
@@ -91,7 +94,7 @@ def main():
              'CLAUDE_CLI_PATH':cli,'BRIDGE_CLI_BARE':'1','BRIDGE_BIND':f'127.0.0.1:{port}',
              'BRIDGE_API_KEY':'smoke-key','BRIDGE_TIMEOUT_SECONDS':'30','RUST_LOG':'warn'}
         logfile=open(Path(tmp)/'bridge.log','w+')
-        bridge=subprocess.Popen([str(ROOT/'target/debug/claude-messages-bridge')],env=env,cwd=tmp,stdout=logfile,stderr=logfile)
+        bridge=subprocess.Popen([str(binary)],env=env,cwd=tmp,stdout=logfile,stderr=logfile)
         def post(payload):
             request=Request(f'http://127.0.0.1:{port}/v1/messages',data=json.dumps(payload).encode(),
                             headers={'content-type':'application/json','x-api-key':'smoke-key','anthropic-version':'2023-06-01'})

@@ -158,7 +158,7 @@ impl MessagesRequest {
         Ok(self)
     }
     pub fn system_parts(&self) -> Result<Vec<String>> {
-        match &self.system {
+        let parts = match &self.system {
             None | Some(Value::Null) => Ok(vec![String::new()]), // Explicitly replace CLI's default coding prompt.
             Some(Value::String(s)) => Ok(vec![s.clone()]),
             Some(Value::Array(bs)) => bs
@@ -174,7 +174,8 @@ impl MessagesRequest {
             _ => Err(ApiError::invalid(
                 "system must be a string or array of text blocks",
             )),
-        }
+        }?;
+        Ok(crate::system_prompt::normalize(parts))
     }
     pub fn active_tools(&self) -> &[Tool] {
         if self

@@ -9,6 +9,7 @@ pub mod request;
 pub mod response;
 pub mod rpc;
 pub mod store;
+pub mod system_prompt;
 
 use axum::{
     Json, Router,

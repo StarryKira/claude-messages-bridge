@@ -199,3 +199,31 @@ async fn dropping_sse_kills_child_and_releases_permit() {
     .await
     .expect("CLI process and permit leaked after client disconnect");
 }
+
+#[tokio::test]
+async fn changed_system_prompt_is_injected_for_each_request_with_snapshots_disabled() {
+    for (stream, text) in [(false, "first prompt"), (true, "different prompt")] {
+        let mut cfg = config("text");
+        cfg.cli_env
+            .insert("FAKE_EXPECT_SYSTEM".into(), json!([text]).to_string());
+        // A parent opt-out must not suppress the requested CLI attribution injection.
+        cfg.cli_env
+            .insert("CLAUDE_CODE_ATTRIBUTION_HEADER".into(), "0".into());
+        let mut payload = body(stream);
+        payload["system"] = json!([
+            {"type":"text","text":"x-anthropic-billing-header: cc_version=0.0.0.abc; cc_entrypoint=sdk-cli; cch=00000;"},
+            {"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+            {"type":"text","text":text}
+        ]);
+        let response = router(AppState::new(cfg))
+            .oneshot(req(payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = text_response(response).await;
+        assert!(!content.contains("event: error"), "{content}");
+        if stream {
+            assert!(content.contains("event: message_stop"));
+        }
+    }
+}

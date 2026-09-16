@@ -145,6 +145,7 @@ async fn run(
         .kill_on_drop(true)
         .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", req.max_tokens.to_string())
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        .env("CLAUDE_CODE_ATTRIBUTION_HEADER", "1")
         .env("DISABLE_AUTOUPDATER", "1")
         .env("DISABLE_AUTO_COMPACT", "1")
         .env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1")
@@ -191,7 +192,8 @@ async fn run(
     write(&mut stdin, &json!({"type":"control_request","request_id":init_id,"request":{
         "subtype":"initialize","systemPrompt":req.system_parts()?,"hooks":{},
         "sdkMcpServers":if req.active_tools().is_empty() { Vec::<&str>::new() } else { vec![MCP_SERVER] },
-        "supportedDialogKinds":[],"promptSuggestions":false,"excludeDynamicSections":true
+        "supportedDialogKinds":[],"promptSuggestions":false,"excludeDynamicSections":true,
+        "systemPromptSnapshot":false
     }})).await?;
     let mut initialized = false;
     let init_deadline = tokio::time::Instant::now() + config.init_timeout;

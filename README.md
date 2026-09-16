@@ -63,6 +63,38 @@ print(message.content)
 
 仅使用原来的 CLI 认证环境时，可不设置 `BRIDGE_ADMIN_TOKEN` 和 `BRIDGE_CREDENTIAL_DB`，直接运行二进制。此时关闭管理接口，继续继承 CLI 已有登录或服务端 API key。直接运行二进制不会自动加载 `.env`。
 
+## 容器与 GitHub Actions
+
+镜像：`ghcr.io/starrykira/claude-messages-bridge:latest`，包含 Rust 服务、React 构建和 **Claude Code 2.1.272** 原生 CLI。提供 `linux/amd64`、`linux/arm64`；CLI 下载按照官方 release manifest 校验 SHA256，自动更新关闭。容器使用 UID/GID `10001:10001`，通过 `/data/credentials.redb` 持久化一个账号。
+
+```sh
+python3 scripts/init-env.py
+# 使用 Actions 发布的镜像
+docker compose pull
+docker compose up -d
+# 或从当前源码构建
+docker compose up -d --build
+```
+
+访问 `http://127.0.0.1:8787/admin/`，使用 `.env` 中的管理令牌登录。若本机服务已占用 8787，改用 `BRIDGE_PORT=8788 docker compose up -d`。Compose 的端口仅暴露在本机，容器内部监听 `0.0.0.0:8787`。不要把宿主机的 `.env`、CLI 登录目录或数据库复制进镜像；构建上下文排除了这些文件。
+
+一个 Compose project 对应一个实例和独立命名数据卷。多账号分别使用不同 `.env`、`BRIDGE_PORT` 和 project 名，例如 `docker compose --env-file .env.account-b -p account-b up -d`。普通重建和 `docker compose down` 保留数据卷；`down -v` 会删除账号凭据及绑定。已有 bind mount 目录需要让 UID 10001 可写。
+
+[CI and container](https://github.com/StarryKira/claude-messages-bridge/actions/workflows/ci.yaml) 在 PR、main 推送、`v*` tag 和手动触发时运行：
+
+1. Rust 格式、Clippy、协议测试，以及 React 构建和 Playwright。
+2. 在 amd64 / arm64 原生 runner 上构建镜像，在禁用外部网络的容器中验证非 root 运行、账号持久化、真实 CLI OAuth、标准工具往返和系统提示词/prefix/cch 注入。
+3. main/tag/手动运行在测试成功后，用 `GITHUB_TOKEN` 推送 GHCR，合并两种架构的 manifest。PR 只测试，不发布。main 发布 `latest`、`main`、`sha-<commit>`；tag 发布对应版本标签。
+
+构建和发布无需配置 Anthropic 凭据。GHCR 权限由 GitHub 的 `packages: write` 提供；私有镜像拉取需要先登录 GHCR。流程参考 [GitHub 容器发布文档](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images) 和 [Docker 多架构 Actions 文档](https://docs.docker.com/build/ci/github-actions/multi-platform/)。CLI 的发行与校验方式见 [官方安装文档](https://code.claude.com/docs/en/setup#binary-integrity-and-code-signing)。
+
+本地验证镜像：
+
+```sh
+docker build -t claude-messages-bridge:local .
+python3 tests/container_smoke.py --image claude-messages-bridge:local
+```
+
 ## 一个实例，一个账号
 
 实例以自己的 redb 文件保存账号绑定，不提供账号列表、切换或轮询。`BRIDGE_MAX_CONCURRENCY` 控制同一账号的并发请求数，不代表账号数。多个实例可以复用同一个 CLI 二进制和前端构建，各自拥有独立的认证缓存和凭据。
@@ -149,7 +181,7 @@ BRIDGE_API_KEY=your-bridge-key python3 examples/tool_roundtrip.py
 | `model` | 交给 CLI 选择；别名、可用模型及权限由 CLI 决定 |
 | `max_tokens` | 必须大于 0，映射到 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`；真实 CLI 测试验证了 128 原值进入上游 |
 | `messages` | 保留结构与角色；合并连续相同角色；首尾必须为 user，不支持 assistant prefill |
-| `system` | 字符串或 text blocks，经 initialize 的 `systemPrompt` 替换默认编码提示 |
+| `system` | 字符串或 text blocks；检测并去除已携带的 CLI 前缀，以 RPC 注入正文，CLI 原生生成 prefix/cch；每次关闭提示词快照，详见下文 |
 | `stream` | JSON 或 SSE，默认 false |
 | `tools` | 自定义工具名、描述、object JSON Schema；不支持服务端工具或工具 beta 扩展 |
 | `tool_choice` | `auto` / `none`；none 通过不注册工具实现 |
@@ -164,6 +196,14 @@ BRIDGE_API_KEY=your-bridge-key python3 examples/tool_roundtrip.py
 `anthropic-version` 可省略；提供时仅接受 `2023-06-01`。
 
 **CLI 固有差异：** CLI 仍会添加自身的身份信息、日期提醒、缓存标记等。2.1.272 的真实测试观察到，日期可能追加到最后一个 tool_result 文本中，或成为 user 消息中的额外 text block。结构、工具 ID、结果内容和角色得到保留，但上游请求不保证与直连 Messages API 逐字相同。该服务不修改 CLI 二进制。
+
+## 系统提示词、prefix 与 cch
+
+每次请求都通过首次 `initialize.systemPrompt` 注入本次 `system`，并显式设置 `systemPromptSnapshot:false`，因此换提示词或恢复历史后不会复用上一份正文。省略、null 或空数组表示空正文，仍由 CLI 处理其身份和归因前缀。
+
+自动检测针对**已包装的 CLI 输入**：识别开头完整的 billing 元数据段和已知 CLI 身份段，清除旧包装后保留正文，再交给 CLI 生成一份新的 prefix/cch。普通自定义正文直接注入；正文内部的引用和未知前缀不做模糊删除。CLI 的完整默认正文受模型和版本影响，RPC 没有完整正文查询接口，所以这里不声称能逐字比对所有版本的默认提示词。
+
+服务开启 CLI 原生 attribution；`cch` 由 CLI runtime 计算，Rust 不硬编码 hash 或复用调用方的值。它位于上游 JSON `system` 中的 billing 文本，不能当成单独的 HTTP header。官方 Anthropic 上游路径已通过真实 CLI + 本地 TLS fixture 验证；第三方网关与 bare 模式遵循 CLI 自身行为。完整说明见 [系统提示词注入](docs/system-prompts.md)。
 
 ## RPC 与历史恢复
 
@@ -181,6 +221,7 @@ BRIDGE_API_KEY=your-bridge-key python3 examples/tool_roundtrip.py
 | `src/rpc.rs` | CLI 生命周期、initialize、中断、MCP / 权限回调、逐行收发 |
 | `src/history.rs` | 原生 transcript、完整工具配对及恢复锚点 |
 | `src/request.rs` | 请求校验、工具名称与 schema 映射 |
+| `src/system_prompt.rs` | 检测并去除输入中已携带的 CLI 提示词包装，保留正文 |
 | `src/response.rs` | 内容增量、tool JSON、thinking、usage 重组与流完整性校验 |
 | `src/config.rs` | 服务环境变量 |
 | `src/admin.rs` | 管理鉴权、OAuth 会话状态、账号操作与模型请求互斥 |
@@ -254,6 +295,6 @@ Rust 测试使用假 CLI，覆盖 RPC 信封、工具往返、JSON/SSE、usage�
 
 `real_oauth_cli` 单独验证真实 CLI 使用由 redb 恢复的原生凭据，推理 HTTP 请求只发往本地假 API。以上测试没有执行真实账号授权。
 
-`real_cli_smoke.py` 使用**真实 CLI + 本机假 Anthropic HTTP 服务**，隔离 HOME/配置并使用 dummy API key，不调用云端模型。它检查结构化历史、max_tokens、SSE、MCP 注册、并行工具、tool_result 恢复、错误工具结果、附带文本与 tool_choice none，同时断言没有多余的 agent 模型轮次。它不验证实际账号登录、模型权限或云端模型质量。
+`real_cli_smoke.py` 使用**真实 CLI + 本机假 Anthropic HTTP 服务**，隔离 HOME/配置并使用 dummy API key，不调用云端模型。它检查结构化历史、max_tokens、SSE、MCP 注册、并行工具、tool_result 恢复、错误工具结果、附带文本与 tool_choice none，同时断言没有多余的 agent 模型轮次。容器测试使用 `--bridge` 指向已构建二进制，无需在运行镜像中安装 Rust。它不验证实际账号登录、模型权限或云端模型质量。
 
 API 格式参考：[Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create)、[Anthropic Streaming](https://platform.claude.com/docs/en/build-with-claude/streaming)、[Axum SSE](https://docs.rs/axum/latest/axum/response/sse/index.html)。

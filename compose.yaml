@@ -1,0 +1,26 @@
+services:
+  bridge:
+    image: ghcr.io/starrykira/claude-messages-bridge:${BRIDGE_IMAGE_TAG:-latest}
+    build:
+      context: .
+    ports:
+      - "127.0.0.1:${BRIDGE_PORT:-8787}:8787"
+    environment:
+      BRIDGE_ADMIN_TOKEN: ${BRIDGE_ADMIN_TOKEN:?Run python3 scripts/init-env.py first}
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY:?Run python3 scripts/init-env.py first}
+      BRIDGE_BIND: 0.0.0.0:8787
+      BRIDGE_CREDENTIAL_DB: /data/credentials.redb
+      BRIDGE_MAX_CONCURRENCY: ${BRIDGE_MAX_CONCURRENCY:-4}
+      BRIDGE_TIMEOUT_SECONDS: ${BRIDGE_TIMEOUT_SECONDS:-180}
+      BRIDGE_OAUTH_TIMEOUT_SECONDS: ${BRIDGE_OAUTH_TIMEOUT_SECONDS:-600}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - account-data:/data
+    restart: unless-stopped
+    stop_grace_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  account-data:
