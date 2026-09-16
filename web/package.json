@@ -1,0 +1,9 @@
+{
+  "name": "claude-messages-console",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {"dev": "vite --host 127.0.0.1", "build": "tsc -b && vite build", "test": "playwright test"},
+  "dependencies": {"react": "^19.3.0", "react-dom": "^19.3.0"},
+  "devDependencies": {"@types/react": "^19", "@types/react-dom": "^19", "@types/node": "^22", "@vitejs/plugin-react": "^6.1.1", "@playwright/test": "^1.58", "typescript": "~5.9.3", "vite": "^8.3.0"}
+}
