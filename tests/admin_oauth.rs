@@ -1,98 +1,40 @@
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
-    extract::State,
     http::{Request, StatusCode},
-    routing::{get, post},
 };
 use claude_messages_bridge::{
     AppState,
     config::Config,
-    oauth::{CLIENT_ID, Endpoints, OAuthClient, REDIRECT_URI},
     router,
     store::{Credential, CredentialStore},
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-use tokio::sync::Mutex;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tower::ServiceExt;
 const ADMIN: &str = "test-admin-token-with-at-least-32-bytes";
-#[derive(Clone, Default)]
-struct MockOAuth {
-    calls: Arc<Mutex<Vec<Value>>>,
-    refreshes: Arc<AtomicUsize>,
-}
-async fn tokens(
-    State(mock): State<MockOAuth>,
-    Json(body): Json<Value>,
-) -> (StatusCode, Json<Value>) {
-    mock.calls.lock().await.push(body.clone());
-    if body["code"] == "bad" {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"Do not expose this secret"})),
-        );
-    }
-    let refresh = body["grant_type"] == "refresh_token";
-    if refresh {
-        mock.refreshes.fetch_add(1, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    }
-    let scope = if body["code"] == "console" {
-        "org:create_api_key user:profile"
-    } else {
-        "user:inference user:profile"
-    };
-    (
-        StatusCode::OK,
-        Json(
-            json!({"access_token":if refresh {"refreshed-secret-access"} else {"secret-access"},"refresh_token":"rotated-secret-refresh","expires_in":3600,"scope":scope,"account":{"email_address":"sample@example.com"}}),
-        ),
-    )
-}
-async fn fake() -> (MockOAuth, Endpoints, tokio::task::JoinHandle<()>) {
-    let mock = MockOAuth::default();
-    let app = Router::new().route("/token",post(tokens)).route("/profile",get(||async{Json(json!({"account":{"email":"sample@example.com"},"organization":{"name":"Example Org","organization_type":"claude_pro"}}))})).route("/api-key",post(||async{Json(json!({"raw_key":"secret-console-key"}))})).with_state(mock.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (
-        mock,
-        Endpoints {
-            token: format!("{base}/token"),
-            profile: format!("{base}/profile"),
-            api_key: format!("{base}/api-key"),
-        },
-        handle,
-    )
-}
-fn state(dir: &std::path::Path, endpoints: Endpoints) -> AppState {
-    let c = Config {
+fn state(dir: &std::path::Path) -> AppState {
+    let mut c = Config {
         admin_token: Some(ADMIN.into()),
         api_key: Some("messages-key".into()),
         credential_db_path: Some(dir.join("creds.redb")),
         cli: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cli.py"),
         ..Config::default()
     };
-    let mut state = AppState::new(c);
-    state.oauth = Arc::new(OAuthClient::new(state.oauth.store.clone(), endpoints).unwrap());
-    state
+    c.cli_env.insert(
+        "FAKE_TRACE".into(),
+        dir.join("rpc.jsonl").display().to_string(),
+    );
+    AppState::new(c)
 }
 fn req(method: &str, path: &str, token: Option<&str>, body: Value) -> Request<Body> {
     let mut b = Request::builder()
         .method(method)
         .uri(path)
         .header("content-type", "application/json");
-    if let Some(t) = token {
-        b = b.header("authorization", format!("Bearer {t}"));
+    if let Some(token) = token {
+        b = b.header("authorization", format!("Bearer {token}"))
     }
     b.body(Body::from(body.to_string())).unwrap()
 }
@@ -102,9 +44,18 @@ async fn call(app: &Router, method: &str, path: &str, body: Value) -> (StatusCod
         .oneshot(req(method, path, Some(ADMIN), body))
         .await
         .unwrap();
-    let s = r.status();
-    let b = r.into_body().collect().await.unwrap().to_bytes();
-    (s, serde_json::from_slice(&b).unwrap())
+    let status = r.status();
+    let bytes = r.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+async fn idle(state: &AppState) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state.permits.available_permits() != state.config.concurrency {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 async fn terminal(app: &Router) -> Value {
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -133,12 +84,27 @@ fn credential() -> Credential {
         email: Some("saved@example.com".into()),
         organization: None,
         subscription: None,
+        native_credentials: Value::Null,
+        native_config: Value::Null,
     }
+}
+fn code(login: &Value, value: &str) -> Value {
+    let url = url::Url::parse(login["authorization_url"].as_str().unwrap()).unwrap();
+    let state = url
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    json!({"code":format!("{value}#{state}")})
+}
+fn callback(login: &Value) -> String {
+    format!("/api/admin/oauth/{}/code", login["id"].as_str().unwrap())
 }
 #[tokio::test]
 async fn admin_auth_is_separate_and_responses_never_leak_credentials() {
     let d = tempfile::tempdir().unwrap();
-    let state = state(d.path(), Endpoints::default());
+    let state = state(d.path());
     state
         .oauth
         .credentials()
@@ -155,54 +121,54 @@ async fn admin_auth_is_separate_and_responses_never_leak_credentials() {
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(r.headers()["cache-control"], "no-store");
     }
-    let (_, body) = call(&app, "GET", "/api/admin/status", Value::Null).await;
-    assert_eq!(body["account"]["email"], "saved@example.com");
-    assert!(!body.to_string().contains("saved-access"));
-    assert!(!body.to_string().contains("saved-refresh"));
-    let r = app
-        .oneshot(req("POST", "/v1/messages", Some(ADMIN), json!({})))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
-    let r = router(AppState::new(Config::default()))
-        .oneshot(req(
-            "POST",
-            "/api/admin/oauth/start",
-            Some(ADMIN),
-            json!({}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let (_, v) = call(&app, "GET", "/api/admin/status", Value::Null).await;
+    assert_eq!(v["account"]["email"], "saved@example.com");
+    assert!(!v.to_string().contains("saved-access"));
+    assert!(!v.to_string().contains("saved-refresh"));
+    assert_eq!(
+        app.oneshot(req("POST", "/v1/messages", Some(ADMIN), json!({})))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        router(AppState::new(Config::default()))
+            .oneshot(req(
+                "POST",
+                "/api/admin/oauth/start",
+                Some(ADMIN),
+                json!({})
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 #[tokio::test]
-async fn oauth_pkce_state_single_use_redb_restart_logout_and_console_key() {
-    use base64::Engine;
-    use sha2::{Digest, Sha256};
-    let (mock, endpoints, server) = fake().await;
+async fn native_oauth_rpcs_state_single_use_redb_restart_logout_and_console() {
     let d = tempfile::tempdir().unwrap();
-    let state = state(d.path(), endpoints);
-    let app = router(state.clone());
+    let state1 = state(d.path());
+    let app = router(state1.clone());
     let (s, login) = call(
         &app,
         "POST",
         "/api/admin/oauth/start",
-        json!({"email":"user@example.com","sso":true}),
+        json!({"method":"claudeai"}),
     )
     .await;
     assert_eq!(s, StatusCode::ACCEPTED);
-    assert_eq!(state.permits.available_permits(), 0);
-    let url = url::Url::parse(login["authorization_url"].as_str().unwrap()).unwrap();
-    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-    assert_eq!(url.host_str(), Some("claude.com"));
-    assert_eq!(params["client_id"], CLIENT_ID);
-    assert_eq!(params["redirect_uri"], REDIRECT_URI);
-    assert_eq!(params["login_method"], "sso");
-    let path = format!("/api/admin/oauth/{}/code", login["id"].as_str().unwrap());
+    assert_eq!(state1.permits.available_permits(), 0);
     assert_eq!(
-        call(&app, "POST", &path, json!({"code":"ok#wrong-state"}))
-            .await
-            .0,
+        call(
+            &app,
+            "POST",
+            &callback(&login),
+            json!({"code":"ok#wrong-state"})
+        )
+        .await
+        .0,
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
@@ -216,67 +182,80 @@ async fn oauth_pkce_state_single_use_redb_restart_logout_and_console_key() {
         StatusCode::CONFLICT
     );
     assert_eq!(
-        call(
-            &app,
-            "POST",
-            &path,
-            json!({"code":format!("ok#{}",params["state"])})
-        )
-        .await
-        .0,
+        call(&app, "POST", &callback(&login), code(&login, "ok"))
+            .await
+            .0,
         StatusCode::OK
     );
     assert_eq!(terminal(&app).await["status"], "succeeded");
+    idle(&state1).await;
     assert_eq!(
-        call(
-            &app,
-            "POST",
-            &path,
-            json!({"code":format!("ok#{}",params["state"])})
-        )
-        .await
-        .0,
+        call(&app, "POST", &callback(&login), code(&login, "ok"))
+            .await
+            .0,
         StatusCode::CONFLICT
     );
-    let calls = mock.calls.lock().await;
-    let verifier = calls[0]["code_verifier"].as_str().unwrap();
+    let trace: Vec<Value> = std::fs::read_to_string(d.path().join("rpc.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
     assert_eq!(
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(Sha256::digest(verifier.as_bytes())),
-        params["code_challenge"]
+        trace
+            .iter()
+            .map(|v| v["request"]["subtype"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["initialize", "claude_authenticate", "claude_oauth_callback"]
     );
-    drop(calls);
+    assert!(trace[1]["request"]["loginWithClaudeAi"].as_bool().unwrap());
+    assert!(trace[2]["request"].get("code_verifier").is_none());
+    let saved = state1.oauth.credentials().unwrap().load().unwrap().unwrap();
+    assert_eq!(saved.access_token, "secret-access");
     assert_eq!(
-        state
+        saved.native_credentials["claudeAiOauth"]["clientId"],
+        "cli-owned-public-client"
+    );
+    let cache = state1.oauth.inference_cache().await.unwrap().unwrap();
+    let cache_path = cache.path().to_owned();
+    drop(cache);
+    drop(app);
+    drop(state1);
+    assert!(!cache_path.exists());
+    let state2 = state(d.path());
+    assert_eq!(
+        state2
             .oauth
             .credentials()
             .unwrap()
             .load()
             .unwrap()
             .unwrap()
-            .access_token,
-        "secret-access"
-    );
-    drop(app);
-    drop(state);
-    let store = CredentialStore::open(&d.path().join("creds.redb")).unwrap();
-    assert_eq!(
-        store.load().unwrap().unwrap().email.as_deref(),
+            .email
+            .as_deref(),
         Some("sample@example.com")
     );
-    drop(store);
-    let (_, endpoints2, server2) = fake().await;
-    let state = state_for_restart(d.path(), endpoints2);
-    let app = router(state.clone());
-    assert_eq!(
-        call(&app, "GET", "/api/admin/status", Value::Null).await.1["account"]["logged_in"],
-        true
-    );
+    let app = router(state2.clone());
+    let cache = state2.oauth.inference_cache().await.unwrap().unwrap();
+    let native: Value =
+        serde_json::from_slice(&std::fs::read(cache.path().join(".credentials.json")).unwrap())
+            .unwrap();
+    assert_eq!(native["claudeAiOauth"]["refreshToken"], "secret-refresh");
+    let cache_path = cache.path().to_owned();
+    drop(cache);
     assert_eq!(
         call(&app, "POST", "/api/admin/logout", json!({})).await.0,
         StatusCode::OK
     );
-    assert!(state.oauth.credentials().unwrap().load().unwrap().is_none());
+    assert!(!cache_path.exists());
+    assert!(
+        state2
+            .oauth
+            .credentials()
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_none()
+    );
     let (_, login) = call(
         &app,
         "POST",
@@ -284,18 +263,11 @@ async fn oauth_pkce_state_single_use_redb_restart_logout_and_console_key() {
         json!({"method":"console"}),
     )
     .await;
-    let url = url::Url::parse(login["authorization_url"].as_str().unwrap()).unwrap();
-    let st = url
-        .query_pairs()
-        .find(|(k, _)| k == "state")
-        .unwrap()
-        .1
-        .into_owned();
-    let path = format!("/api/admin/oauth/{}/code", login["id"].as_str().unwrap());
-    call(&app, "POST", &path, json!({"code":format!("console#{st}")})).await;
+    call(&app, "POST", &callback(&login), code(&login, "console")).await;
     assert_eq!(terminal(&app).await["status"], "succeeded");
+    idle(&state2).await;
     assert_eq!(
-        state
+        state2
             .oauth
             .credentials()
             .unwrap()
@@ -306,47 +278,12 @@ async fn oauth_pkce_state_single_use_redb_restart_logout_and_console_key() {
             .as_deref(),
         Some("secret-console-key")
     );
-    server.abort();
-    server2.abort();
-}
-fn state_for_restart(dir: &std::path::Path, e: Endpoints) -> AppState {
-    state(dir, e)
 }
 #[tokio::test]
-async fn token_refresh_is_single_flight_and_persisted() {
-    let (mock, endpoints, server) = fake().await;
+async fn cancel_expire_rpc_failure_and_request_gate_preserve_previous_account() {
     let d = tempfile::tempdir().unwrap();
-    let state = state(d.path(), endpoints);
-    let mut c = credential();
-    c.expires_at = 0;
-    state.oauth.credentials().unwrap().save(&c).unwrap();
-    let (a, b) = tokio::join!(
-        state.oauth.inference_credential(),
-        state.oauth.inference_credential()
-    );
-    assert_eq!(a.unwrap().unwrap().access_token, "refreshed-secret-access");
-    assert_eq!(b.unwrap().unwrap().access_token, "refreshed-secret-access");
-    assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        state
-            .oauth
-            .credentials()
-            .unwrap()
-            .load()
-            .unwrap()
-            .unwrap()
-            .refresh_token
-            .as_deref(),
-        Some("rotated-secret-refresh")
-    );
-    server.abort();
-}
-#[tokio::test]
-async fn cancel_expire_provider_failure_and_request_gate_preserve_previous_account() {
-    let (_, endpoints, server) = fake().await;
-    let d = tempfile::tempdir().unwrap();
-    let mut state = state(d.path(), endpoints);
-    Arc::get_mut(&mut state.config).unwrap().oauth_timeout = Duration::from_millis(200);
+    let mut state = state(d.path());
+    Arc::get_mut(&mut state.config).unwrap().oauth_timeout = Duration::from_millis(150);
     state
         .oauth
         .credentials()
@@ -363,21 +300,16 @@ async fn cancel_expire_provider_failure_and_request_gate_preserve_previous_accou
     );
     drop(permit);
     let (_, login) = call(&app, "POST", "/api/admin/oauth/start", json!({})).await;
-    let url = url::Url::parse(login["authorization_url"].as_str().unwrap()).unwrap();
-    let st = url
-        .query_pairs()
-        .find(|(k, _)| k == "state")
-        .unwrap()
-        .1
-        .into_owned();
-    let path = format!("/api/admin/oauth/{}/code", login["id"].as_str().unwrap());
-    call(&app, "POST", &path, json!({"code":format!("bad#{st}")})).await;
+    call(&app, "POST", &callback(&login), code(&login, "bad")).await;
     let failed = terminal(&app).await;
     assert_eq!(failed["status"], "failed");
     assert!(!failed.to_string().contains("Do not expose"));
+    idle(&state).await;
     call(&app, "POST", "/api/admin/oauth/start", json!({})).await;
     assert_eq!(terminal(&app).await["status"], "expired");
+    idle(&state).await;
     let (_, login) = call(&app, "POST", "/api/admin/oauth/start", json!({})).await;
+    call(&app, "POST", &callback(&login), code(&login, "hang")).await;
     call(
         &app,
         "DELETE",
@@ -385,13 +317,7 @@ async fn cancel_expire_provider_failure_and_request_gate_preserve_previous_accou
         Value::Null,
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while state.permits.available_permits() != 4 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    idle(&state).await;
     assert_eq!(
         state
             .oauth
@@ -403,7 +329,32 @@ async fn cancel_expire_provider_failure_and_request_gate_preserve_previous_accou
             .access_token,
         "saved-access"
     );
-    server.abort();
+}
+#[tokio::test]
+async fn native_cli_refresh_is_written_to_redb_and_shared_cache_is_reused() {
+    let d = tempfile::tempdir().unwrap();
+    let mut state = state(d.path());
+    state
+        .oauth
+        .credentials()
+        .unwrap()
+        .save(&credential())
+        .unwrap();
+    Arc::get_mut(&mut state.config)
+        .unwrap()
+        .cli_env
+        .insert("FAKE_MODE".into(), "managed".into());
+    let (a, b) = tokio::join!(state.oauth.inference_cache(), state.oauth.inference_cache());
+    let a = a.unwrap().unwrap();
+    let b = b.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&a, &b));
+    let app = router(state.clone());
+    let r=app.oneshot(req("POST","/v1/messages",Some("messages-key"),json!({"model":"test-model","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}))).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    idle(&state).await;
+    let saved = state.oauth.credentials().unwrap().load().unwrap().unwrap();
+    assert_eq!(saved.access_token, "refreshed-by-cli");
+    assert_eq!(saved.refresh_token.as_deref(), Some("rotated-by-cli"));
 }
 #[test]
 fn redb_file_permissions_and_failed_reopen_are_safe() {
@@ -420,7 +371,6 @@ fn redb_file_permissions_and_failed_reopen_are_safe() {
             0o600
         );
     }
-    assert!(!d.path().join(".credentials.json").exists());
     store.clear().unwrap();
     drop(store);
     assert!(
@@ -432,21 +382,15 @@ fn redb_file_permissions_and_failed_reopen_are_safe() {
     );
 }
 #[tokio::test]
-async fn redb_credential_is_used_by_rpc_without_exposing_refresh_token() {
+async fn unsupported_login_options_are_rejected_instead_of_implemented_in_rust() {
     let d = tempfile::tempdir().unwrap();
-    let mut state = state(d.path(), Endpoints::default());
-    state
-        .oauth
-        .credentials()
-        .unwrap()
-        .save(&credential())
-        .unwrap();
-    let config = Arc::get_mut(&mut state.config).unwrap();
-    config.cli_env.insert("FAKE_MODE".into(), "managed".into());
-    config
-        .cli_env
-        .insert("ANTHROPIC_API_KEY".into(), "must-not-reach-cli".into());
-    let app = router(state);
-    let r=app.oneshot(req("POST","/v1/messages",Some("messages-key"),json!({"model":"test-model","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}))).await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    let app = router(state(d.path()));
+    for body in [json!({"email":"user@example.com"}), json!({"sso":true})] {
+        let r = app
+            .clone()
+            .oneshot(req("POST", "/api/admin/oauth/start", Some(ADMIN), body))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
 }

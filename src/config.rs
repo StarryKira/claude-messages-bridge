@@ -99,7 +99,9 @@ impl Config {
         command
             .envs(&self.cli_env)
             .env_remove("BRIDGE_ADMIN_TOKEN")
-            .env_remove("BRIDGE_API_KEY");
+            .env_remove("BRIDGE_API_KEY")
+            .env_remove("CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH")
+            .env_remove("CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH");
         if self.credential_db_path.is_some() {
             for key in [
                 "ANTHROPIC_API_KEY",

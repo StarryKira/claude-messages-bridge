@@ -1,80 +1,81 @@
-# OAuth 客户端与 redb 持久化
+# CLI OAuth RPC 与 redb 持久化
 
-依据：Claude Code **2.1.272** 的本地二进制分析。以下是对其内嵌 JavaScript 中 OAuth 行为的协议归纳，不是供应商承诺稳定的公共 API；CLI 升级时应复核。SDK–CLI 控制请求见 [协议文档](sdk-cli-control-requests.md)。
+依据：Claude Code **2.1.272** 的原生 stdio 控制处理器和真实 CLI 联调。SDK 控制请求总表见 [协议文档](sdk-cli-control-requests.md)。这些内部接口可能随 CLI 版本变化。
 
-## 数据流
-
-```text
-React ── Admin Bearer ──> Axum 管理 API
-       <── 官方授权 URL ── Rust 生成 state/verifier + PKCE S256
-浏览器 ── 用户授权 ──> Claude 官方页面 ──> code#state
-React ── code#state ──> Rust 校验 state ──> 官方 token endpoint
-                                      └─> redb 事务保存
-
-Messages 调用方 ── 网关 API key ──> Axum
-                                  ├─ redb 读取 / 必要时刷新并写回
-                                  └─ CLI 临时环境：access token / API key
-                                     └─ stdio SDK 控制协议 ──> 模型
-```
-
-## 官方 OAuth 请求
-
-公开客户端 ID：`9d1c250a-e61b-44d9-88ed-5944d1962f5e`。不使用 client secret。
-
-| 用途 | 端点 |
-|---|---|
-| Claude 订阅授权 | `https://claude.com/cai/oauth/authorize` |
-| Console 授权 | `https://platform.claude.com/oauth/authorize` |
-| 手动回调 | `https://platform.claude.com/oauth/code/callback` |
-| 交换 / 刷新 token | `https://platform.claude.com/v1/oauth/token` |
-| 账号资料 | `https://api.anthropic.com/api/oauth/profile` |
-| Console API key | `https://api.anthropic.com/api/oauth/claude_cli/create_api_key` |
-
-授权 GET 参数：`code=true`、`response_type=code`、`client_id`、`redirect_uri`、`state`、`code_challenge`、`code_challenge_method=S256` 和 `scope`。`code_challenge` 是 verifier 的 SHA-256 摘要经 base64url 无填充编码。可选 `login_hint` 为邮箱，企业登录使用 `login_method=sso`。
-
-请求的 scope 与该版本 CLI 一致：
+## 请求边界
 
 ```text
-org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload
+React ── Admin Bearer ──> Axum
+                         └─ stdio control_request ──> Claude Code CLI
+                                                      ├─ 官方 OAuth / profile
+                                                      ├─ token 刷新
+                                                      ├─ Console API key
+                                                      └─ Messages / CLI 遥测
+
+redb <── 保存 CLI 更新 ── 私有临时认证缓存 ── CLI 原生凭据存储
+      ── 启动时恢复 ───>
 ```
 
-授权码交换使用 POST JSON：
+Rust 没有发往 Anthropic 的 HTTP 客户端，不构造 token 请求，不生成 PKCE，不固定 OAuth client ID 或 scope。浏览器打开的官方授权链接也由 CLI 返回。
+
+## 1. 发起登录
+
+同一个 CLI 进程先完成 `initialize`，随后发送：
 
 ```json
-{
-  "grant_type": "authorization_code",
-  "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-  "code": "<授权码，不含 #state>",
-  "state": "<服务端保存的随机 state>",
-  "code_verifier": "<只存在服务端内存的 verifier>",
-  "redirect_uri": "https://platform.claude.com/oauth/code/callback"
-}
+{"type":"control_request","request_id":"auth-1","request":{"subtype":"claude_authenticate","loginWithClaudeAi":true}}
 ```
 
-读取响应中的 `access_token`、`refresh_token`、`expires_in`、`scope` 以及可选 `account`、`organization`。资料请求使用 `Authorization: Bearer <access_token>`；资料请求失败不阻止保存有效授权。
+`true` 为 Claude 订阅，`false` 为 Console。成功响应的业务 payload：
 
-含 `user:inference` 时使用 OAuth access token 推理。Console 授权如果没有该 scope、但具有 `org:create_api_key`，则向 Console key 端点 POST JSON `null`，使用 Bearer access token，从响应 `raw_key` 保存 API key。两种方式的凭据都留在 redb。
+```json
+{"manualUrl":"https://claude.com/cai/oauth/authorize?...","automaticUrl":"https://claude.com/cai/oauth/authorize?..."}
+```
 
-刷新使用 POST JSON：`grant_type=refresh_token`、`refresh_token`、`client_id`、已授予 scopes 拼接的 `scope`。当前实现于推理前五分钟刷新，不启动后台定时任务；单进程互斥避免多个请求重复使用已轮换的 refresh token。新响应省略 refresh token 时保留旧值。
+CLI 负责随机 state、PKCE verifier/challenge、client ID、scope、回调监听器与官方 URL。前端只使用 `manualUrl`；服务校验返回的 HTTPS 域名并提取 state，以校验后续粘贴的 `code#state`。CLI RPC 不支持邮箱提示或 SSO 参数，桥接器拒绝这些额外字段；用户在官方页面选择登录方式。
 
-OAuth HTTP 客户端禁用重定向、设置 30 秒超时、限制响应体 256 KiB；错误只暴露 HTTP 状态，不回传供应商响应体或 token 请求内容。运行时不接受浏览器指定 OAuth endpoint。
+## 2. 提交授权码
 
-## 会话与存储
+在启动该授权的同一个 CLI 进程中发送：
 
-授权会话状态为 `waiting → submitting → succeeded / failed`，也可进入 `cancelled / expired`。授权会话只在内存中，重启后需要重新开始尚未完成的授权。state 必须匹配，完整授权码只接受一次；取消或失败时保留现有账号。
+```json
+{"type":"control_request","request_id":"auth-2","request":{"subtype":"claude_oauth_callback","authorizationCode":"<code>","state":"<state>"}}
+```
 
-redb 表 `oauth_credentials_v1`：键为 `active`，值为序列化的 Credential 字节。保存字段：`access_token`、`refresh_token`、`expires_at`（Unix 秒）、`scopes`、可选 `api_key`、`method`、`email`、`organization`、`subscription`。JSON 是数据库值的编码方式，没有单独写出 JSON 凭据文件。
+本地接口先验证完整 `code#state`，随后只把 code 和 state 字段传给 CLI。CLI 内部使用其保存的 verifier 和 state 交换 token、查询 profile、处理 Console API key、检查组织策略并保存凭据。成功 payload 包含 `account.email`、`organization`、`subscriptionType`、`tokenSource`、`apiKeySource`、`apiProvider` 等元数据，不包含 token。
 
-数据库独占打开，文件权限 `0600`，写入/删除提交事务；重启可恢复。当前只保留一个账号，不提供账号池、导出 token 或远程数据库接口。状态接口从白名单字段构造响应，账号凭据不返回浏览器。
+`claude_oauth_callback` 本身等待登录 flow 完成。不能在它成功后再调用 `claude_oauth_wait_for_completion`，因为 CLI 可能已经清理该 flow；后者用于开始登录后等待浏览器自动回调的流程：
 
-redb 没有额外静态加密。退出删除 active 记录，不保证底层空闲页覆盖，不撤销供应商授权。需要整体保护时应使用加密磁盘和受控备份。管理令牌、网关 API key 通过 `.env` / 进程环境配置，与上游 OAuth 凭据分开。
+```json
+{"type":"control_request","request_id":"auth-3","request":{"subtype":"claude_oauth_wait_for_completion"}}
+```
 
-CLI 的 `CLAUDE_CONFIG_DIR` 和 `CLAUDE_SECURESTORAGE_CONFIG_DIR` 指向每个请求的临时目录，旧的上游认证环境变量先清除。OAuth 模式只注入 `CLAUDE_CODE_OAUTH_TOKEN`，Console key 模式注入 `ANTHROPIC_API_KEY`；refresh token、管理令牌、网关密钥不传入 CLI。请求结束回收子进程及临时目录。
+本控制台采用手动回调，所以仅发送前两种认证 RPC。取消或超时关闭对应 CLI 进程；CLI 退出后清理未完成授权的临时目录，不替换现有账号。
 
-## 证据定位与验证
+## 3. 凭据与自动刷新
 
-该二进制字节偏移约 167203173–167206600 包含 OAuth 配置；169805059–169807000 附近包含授权链接、授权码交换和刷新；169803166 附近包含资料请求；169810050 附近包含 Console key 请求；184661981 附近包含 PKCE 与手动回调处理。偏移仅用于定位这一版本，不能套用于其他二进制。
+CLI 的认证 RPC 不直接返回完整 access/refresh token，因此持久化采用本地原生存储适配，不增加 HTTP 请求：
 
-`tests/admin_oauth.rs` 使用本地 OAuth HTTP fixture 检验 PKCE、state、刷新轮换、redb 恢复与退出、Console key 和错误脱敏；`tests/real_oauth_cli.rs` 用真实 CLI 对接本地假推理 API，验证 redb access token 注入。测试没有使用真实账号或调用云端模型。
+1. 登录 CLI 使用独立私有缓存，`CLAUDE_CONFIG_DIR` 和 `CLAUDE_SECURESTORAGE_CONFIG_DIR` 都指向该目录。
+2. CLI 完成原生登录、保存凭据并返回 RPC 成功应答后，桥接器读取缓存并提交 redb 事务。
+3. 推理 CLI 从当前账号缓存读取完整原生凭据，按自身逻辑刷新 token。桥接器没有自定义刷新 RPC 或 Rust 刷新 HTTP 实现。
+4. 初始化后、完整模型响应发送前及请求清理时，将最新凭据写回 redb。并发 CLI 共用认证缓存，以复用 CLI 的跨进程刷新锁与 CAS 更新。
+5. 退出账号清除 redb 和缓存。此操作只涉及本地存储，不撤销供应商侧授权。
 
-背景参考：[Claude Code 身份认证](https://code.claude.com/docs/en/authentication)、[CLI auth 命令](https://code.claude.com/docs/en/cli-reference)。上述内部端点细节来自本地二进制分析，而非这两份公开文档的接口保证。
+macOS 通过私有 PATH 下的 `security` 兼容脚本，把原生凭据服务映射为缓存内的 `.keychain-credentials.json` / `.console-key`。脚本仅接受与当前目录 hash 对应的服务名称，不调用真正的系统 keychain，不访问网络。CLI 的 `.credentials.json` 文件回退与模拟 keychain 分开，避免原生代码在迁移到主存储后删除回退文件时删除同一份数据。Linux 直接使用 CLI 的原生文件存储。
+
+临时目录为 `0700`，凭据文件为 `0600`。正常退出清理缓存，崩溃可能遗留临时文件或尚未同步的刷新结果；不能宣称运行期间凭据从不写入临时 JSON。redb 为持久化来源，文件本身没有额外加密。
+
+## 4. redb 兼容与公开状态
+
+沿用 `oauth_credentials_v1` 表和 `active` 键。旧记录的 access/refresh token、过期时间、scope、API key 与元数据仍可读取；新增 `native_credentials`、`native_config` 保留 CLI 原生的 `clientId`、`refreshTokenExpiresAt`、订阅/限额字段及必要账号信息，避免刷新时丢失 CLI 需要的字段。旧记录缺少新字段时自动构造兼容缓存，无需重新登录才能迁移。
+
+管理状态只返回账号元数据，token 不返回前端。CLI stderr 和控制应答中的错误内容不直接透传到浏览器，避免带出凭据。管理令牌和 Messages key 不传入 CLI。
+
+## 验证
+
+- `tests/admin_oauth.rs`：原生 RPC 顺序、state、单次提交、取消、超时、错误脱敏、redb 恢复、CLI 更新写回、退出清理。
+- `tests/real_auth_rpc_smoke.py`：真实 CLI，通过只响应本地数据的 HTTPS 代理验证 OAuth RPC、PKCE、profile、Console key、刷新、模型调用及重启。CLI 二进制未修改，测试不访问真实 Anthropic 服务。
+- `tests/real_oauth_cli.rs`：真实 CLI 从恢复的原生凭据发起模型请求。
+
+本次分析修正了早期 Rust 直接实现 OAuth HTTP 的方案。服务端对 Anthropic 的访问统一归 CLI 执行，Rust 保留 Axum API、RPC 编排和本地存储职责。

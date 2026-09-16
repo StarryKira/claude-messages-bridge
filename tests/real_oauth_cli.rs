@@ -61,7 +61,7 @@ async fn real_cli_uses_access_token_from_redb() {
         .unwrap()
         .save(&Credential {
             access_token: "sk-ant-oat01-local-dummy-token".into(),
-            refresh_token: Some("refresh-must-stay-in-redb".into()),
+            refresh_token: Some("dummy-native-refresh".into()),
             expires_at: chrono::Utc::now().timestamp() + 3600,
             scopes: vec!["user:inference".into()],
             api_key: None,
@@ -69,6 +69,8 @@ async fn real_cli_uses_access_token_from_redb() {
             email: None,
             organization: None,
             subscription: None,
+            native_credentials: Value::Null,
+            native_config: Value::Null,
         })
         .unwrap();
     let app = router(state);

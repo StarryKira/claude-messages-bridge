@@ -32,13 +32,11 @@ test('admin authentication, secret memory, API instructions and responsive layou
 })
 test('real admin routes create PKCE authorization, reject mismatched state, and cancel',async({page})=>{
   await unlock(page)
-  await page.getByLabel('登录邮箱').fill('person@example.com')
   await page.getByRole('button',{name:'开始 OAuth 登录'}).click()
   const link=page.getByRole('link',{name:'打开官方授权页面'})
   await expect(link).toBeVisible()
   const url=new URL((await link.getAttribute('href'))!)
   expect(url.origin).toBe('https://claude.com');expect(url.searchParams.get('code_challenge_method')).toBe('S256')
-  expect(url.searchParams.get('login_hint')).toBe('person@example.com')
   expect(await link.getAttribute('rel')).toContain('noreferrer')
   await page.getByLabel('授权码',{exact:true}).fill('invalid-code#wrong-state')
   await page.getByRole('button',{name:'提交授权码'}).click()

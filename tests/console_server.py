@@ -10,7 +10,8 @@ with tempfile.TemporaryDirectory(prefix='bridge-console-test-') as directory:
     env={**os.environ,'BRIDGE_ADMIN_TOKEN':'browser-test-admin-token-minimum-32-bytes',
          'BRIDGE_API_KEY':'browser-messages-key','BRIDGE_CREDENTIAL_DB':directory+'/credentials.redb',
          'BRIDGE_BIND':'127.0.0.1:8791','BRIDGE_WEB_DIR':str(ROOT/'web/dist'),
-         'BRIDGE_CLI_BARE':'0','RUST_LOG':'warn'}
+         'BRIDGE_CLI_BARE':'0','RUST_LOG':'warn',
+         'CLAUDE_CLI_PATH':str(ROOT/'tests/fixtures/cli.py')}
     child=subprocess.Popen([str(ROOT/'target/debug/claude-messages-bridge')],env=env,cwd=ROOT)
     def stop(*_): child.terminate()
     signal.signal(signal.SIGTERM,stop);signal.signal(signal.SIGINT,stop)

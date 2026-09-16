@@ -36,13 +36,26 @@ pub fn start(
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(async move {
         let _permit = permit;
-        let work = run(&config, &oauth, request, &tx, &cancel);
+        let cache = match oauth.inference_cache().await {
+            Ok(cache) => cache,
+            Err(error) => {
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+        };
+        let work = run(&config, &oauth, cache.as_ref(), request, &tx, &cancel);
         let result = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => Ok(()),
             r = tokio::time::timeout(config.request_timeout, work) => r.unwrap_or_else(|_| Err(ApiError::timeout())),
         };
-        if let Err(error) = result {
+        // Persist native CLI token rotation even on errors or client disconnect.
+        let persisted = if let Some(cache) = &cache {
+            oauth.sync(cache).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result.and(persisted) {
             tracing::warn!(error_type = error.kind, "CLI request failed");
             tokio::select! { _ = cancel.cancelled() => {}, _ = tx.send(Err(error)) => {} }
         }
@@ -56,6 +69,7 @@ pub fn start(
 async fn run(
     config: &Config,
     oauth: &crate::oauth::OAuthClient,
+    cache: Option<&Arc<crate::credential_cache::CredentialCache>>,
     req: MessagesRequest,
     tx: &mpsc::Sender<Result<Value>>,
     cancel: &CancellationToken,
@@ -68,21 +82,8 @@ async fn run(
     let history = seed_history(&req, directory.path(), &sid).await?;
     let mut command = Command::new(&config.cli);
     config.apply_cli_env(&mut command);
-    if let Some(credential) = oauth.inference_credential().await? {
-        // Access credentials only enter the child environment. No credential JSON
-        // or persistent OS keychain entry is created by the bridge.
-        let cli_dir = directory.path().join("cli-config");
-        tokio::fs::create_dir(&cli_dir)
-            .await
-            .map_err(|_| ApiError::upstream("Cannot create temporary CLI config"))?;
-        command
-            .env("CLAUDE_CONFIG_DIR", &cli_dir)
-            .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", &cli_dir);
-        if let Some(key) = credential.api_key {
-            command.env("ANTHROPIC_API_KEY", key);
-        } else {
-            command.env("CLAUDE_CODE_OAUTH_TOKEN", credential.access_token);
-        }
+    if let Some(cache) = cache {
+        cache.apply(&mut command)?;
     }
     command.args([
         "-p",
@@ -228,6 +229,9 @@ async fn run(
                 if frame["response"]["subtype"] != "success" {
                     return Err(ApiError::upstream("CLI rejected initialize RPC"));
                 }
+                if let Some(cache) = cache {
+                    oauth.sync(cache).await?;
+                }
                 initialized = true;
                 let last = req.messages.last().unwrap();
                 write(
@@ -253,6 +257,9 @@ async fn run(
                     ));
                 }
                 let complete = accumulator.complete();
+                if complete && let Some(cache) = cache {
+                    oauth.sync(cache).await?;
+                }
                 tx.send(Ok(event))
                     .await
                     .map_err(|_| ApiError::upstream("HTTP client disconnected"))?;

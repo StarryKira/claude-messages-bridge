@@ -1,5 +1,7 @@
 pub mod admin;
 pub mod config;
+pub mod control;
+pub mod credential_cache;
 pub mod error;
 pub mod history;
 pub mod oauth;
@@ -46,7 +48,7 @@ impl AppState {
             .as_deref()
             .map(store::CredentialStore::open)
             .transpose()?;
-        let oauth = Arc::new(oauth::OAuthClient::new(store, oauth::Endpoints::default())?);
+        let oauth = Arc::new(oauth::OAuthClient::new(store));
         Ok(Self {
             permits: Arc::new(Semaphore::new(config.concurrency)),
             config: Arc::new(config),

@@ -1,7 +1,6 @@
 use crate::{
     AppState,
     error::{ApiError, Result},
-    oauth::Authorization,
     same_secret,
 };
 use axum::{
@@ -48,9 +47,6 @@ impl LoginView {
 struct LoginRequest {
     #[serde(default = "default_method")]
     method: String,
-    email: Option<String>,
-    #[serde(default)]
-    sso: bool,
 }
 fn default_method() -> String {
     "claudeai".into()
@@ -173,13 +169,6 @@ async fn start_login(
     if !matches!(request.method.as_str(), "claudeai" | "console") {
         return Err(ApiError::invalid("method must be claudeai or console"));
     }
-    if let Some(email) = &request.email
-        && (email.len() > 254
-            || email.chars().any(char::is_control)
-            || (!email.is_empty() && !email.contains('@')))
-    {
-        return Err(ApiError::invalid("Invalid login email"));
-    }
     if state.shutdown.is_cancelled() {
         return Err(conflict("Server is shutting down"));
     }
@@ -200,7 +189,12 @@ async fn start_login(
         .map_err(|_| {
             conflict("Wait for active Messages requests or account operations to finish")
         })?;
-    let auth = Authorization::new(&request.method, request.email.as_deref(), request.sso);
+    let mut auth = tokio::time::timeout(
+        state.config.init_timeout,
+        state.oauth.authorize(&state.config, &request.method),
+    )
+    .await
+    .map_err(|_| ApiError::upstream("CLI authorization RPC timed out"))??;
     let id = Uuid::new_v4().to_string();
     let expires = chrono::Utc::now()
         + chrono::Duration::from_std(state.config.oauth_timeout)
@@ -225,11 +219,19 @@ async fn start_login(
         let _permit = permit;
         let work = async {
             let code = rx.recv().await.ok_or_else(|| conflict("Login cancelled"))?;
-            let credential = state.oauth.exchange(&auth, &code, &request.method).await?;
+            let credential = state.oauth.complete(&mut auth, &code).await?;
+            // Serialize cancellation with the redb commit so a cancelled response
+            // cannot race a successfully replaced account.
+            let mut operation = admin.operation.lock().await;
             if cancel.is_cancelled() {
                 return Err(conflict("Login cancelled"));
             }
-            state.oauth.credentials()?.save(&credential)
+            state.oauth.commit(&auth, &credential).await?;
+            if let Some(op) = operation.as_mut().filter(|op| op.view.id == id) {
+                op.view.status = "succeeded".into();
+                op.view.authorization_url = None;
+            }
+            Ok::<(), ApiError>(())
         };
         let result = tokio::select! {
             biased;
@@ -240,6 +242,7 @@ async fn start_login(
                 Ok(Ok(())) => ("succeeded", None),
             }
         };
+        auth.client.close().await;
         let mut op = admin.operation.lock().await;
         if let Some(op) = op.as_mut().filter(|op| op.view.id == id) {
             op.view.status = result.0.into();
@@ -317,6 +320,6 @@ async fn logout(State(state): State<AppState>) -> Result<Json<Value>> {
                 .map_err(|_| conflict("Invalid concurrency configuration"))?,
         )
         .map_err(|_| conflict("Wait for active requests to finish before logging out"))?;
-    state.oauth.credentials()?.clear()?;
+    state.oauth.logout().await?;
     Ok(Json(json!({"logged_out":true})))
 }

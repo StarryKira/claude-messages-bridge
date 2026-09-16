@@ -17,6 +17,10 @@ pub struct Credential {
     pub email: Option<String>,
     pub organization: Option<String>,
     pub subscription: Option<String>,
+    #[serde(default)]
+    pub native_credentials: Value,
+    #[serde(default)]
+    pub native_config: Value,
 }
 impl Credential {
     pub fn public_view(&self) -> Value {

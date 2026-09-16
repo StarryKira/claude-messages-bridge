@@ -17,11 +17,18 @@ def event(value): emit({'type':'stream_event','parent_tool_use_id':None,'event':
 init = receive()
 assert init['request']['subtype'] == 'initialize'
 if mode == 'managed':
-    assert os.environ['CLAUDE_CODE_OAUTH_TOKEN']=='saved-access'
+    assert 'CLAUDE_CODE_OAUTH_TOKEN' not in os.environ
+    cache=Path(os.environ['CLAUDE_CONFIG_DIR']) / '.credentials.json'
+    credentials=json.loads(cache.read_text())
+    assert credentials['claudeAiOauth']['accessToken']=='saved-access'
+    assert credentials['claudeAiOauth']['refreshToken']=='saved-refresh'
+    credentials['claudeAiOauth']['accessToken']='refreshed-by-cli'
+    credentials['claudeAiOauth']['refreshToken']='rotated-by-cli'
+    cache.write_text(json.dumps(credentials))
     assert 'ANTHROPIC_API_KEY' not in os.environ
     assert 'CLAUDE_CODE_OAUTH_REFRESH_TOKEN' not in os.environ
     assert 'BRIDGE_ADMIN_TOKEN' not in os.environ
-    assert not (Path(os.environ['CLAUDE_CONFIG_DIR']) / '.credentials.json').exists()
+
 if mode == 'init_hang': time.sleep(60); sys.exit(0)
 if mode == 'init_error':
     emit({'type':'control_response','response':{'subtype':'error','request_id':init['request_id'],'error':'fixture error'}}); sys.exit(0)
@@ -32,6 +39,26 @@ if init['request']['sdkMcpServers']:
     assert reply['response']['response']['mcp_response']['result']['tools'][0]['name']=='weather'
 emit({'type':'control_response','response':{'subtype':'success','request_id':init['request_id'],'response':{}}})
 user=receive()
+if user.get('type')=='control_request' and user['request']['subtype']=='claude_authenticate':
+    import secrets
+    state=secrets.token_urlsafe(32)
+    domain='claude.com/cai' if user['request']['loginWithClaudeAi'] else 'platform.claude.com'
+    emit({'type':'control_response','response':{'subtype':'success','request_id':user['request_id'],'response':{'manualUrl':f'https://{domain}/oauth/authorize?state={state}&code_challenge=cli-owned-challenge&code_challenge_method=S256','automaticUrl':'http://localhost/unused'}}})
+    callback=receive()
+    assert callback['request']['subtype']=='claude_oauth_callback'
+    assert callback['request']['state']==state
+    code=callback['request']['authorizationCode']
+    if code=='hang':time.sleep(60);sys.exit(0)
+    if code=='bad':
+        emit({'type':'control_response','response':{'subtype':'error','request_id':callback['request_id'],'error':'Do not expose this secret'}})
+    else:
+        cache=Path(os.environ['CLAUDE_CONFIG_DIR'])
+        if code=='console':(cache/'.console-key').write_text('secret-console-key')
+        else:(cache/'.credentials.json').write_text(json.dumps({'claudeAiOauth':{'accessToken':'secret-access','refreshToken':'secret-refresh','expiresAt':int(time.time()*1000)+3600000,'scopes':['user:inference','user:profile'],'subscriptionType':'pro','rateLimitTier':'default','clientId':'cli-owned-public-client'}}))
+        (cache/'.claude.json').write_text(json.dumps({'oauthAccount':{'emailAddress':'sample@example.com','accountUuid':'fixture-id'},'userID':'cli-generated-device-id'}))
+        emit({'type':'control_response','response':{'subtype':'success','request_id':callback['request_id'],'response':{'account':{'email':'sample@example.com','organization':'Example Org','subscriptionType':'pro'}}}})
+    while sys.stdin.readline():pass
+    sys.exit(0)
 assert user['type']=='user'
 if mode == 'history':
     path = sys.argv[sys.argv.index('--resume')+1]

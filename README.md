@@ -29,7 +29,7 @@ bash scripts/run-console.sh
 
 初始化脚本生成 `.env`（权限 `0600`）中的随机 `BRIDGE_ADMIN_TOKEN` 和独立的 `BRIDGE_API_KEY`，不会覆盖已有配置或打印密钥。启动脚本加载 `.env`，数据库位于 `.bridge/credentials.redb`；数据库文件权限为 `0600`，运行目录为 `0700`。
 
-打开 [Web 控制台](http://127.0.0.1:8787/admin/)，使用 `.env` 中的 `BRIDGE_ADMIN_TOKEN` 解锁，点击「开始 OAuth 登录」。在 Claude 官方页面完成授权，将页面提供的完整 `code#state` 粘贴回控制台。可以选择 Claude 订阅或 Anthropic Console，支持邮箱提示和企业 SSO。凭据保存在服务器的 redb 中，重启服务后仍然可用。当前管理一个服务账号，新账号成功登录后替换旧账号。
+打开 [Web 控制台](http://127.0.0.1:8787/admin/)，使用 `.env` 中的 `BRIDGE_ADMIN_TOKEN` 解锁，点击「开始 OAuth 登录」。在 Claude 官方页面完成授权，将页面提供的完整 `code#state` 粘贴回控制台。可以选择 Claude 订阅或 Anthropic Console；邮箱和企业 SSO 在官方页面选择。凭据保存在服务器的 redb 中，重启服务后仍然可用。当前管理一个服务账号，新账号成功登录后替换旧账号。
 
 默认监听 `127.0.0.1:8787`。`GET /healthz` 仅检查服务存活，不检查 CLI 登录或模型权限。示例请求需要先加载网关密钥：
 
@@ -65,22 +65,26 @@ print(message.content)
 
 ## OAuth 与 redb
 
-Rust OAuth 客户端实现 Claude Code 2.1.272 的授权码 + PKCE S256 流程，使用官方手动回调页面，因此浏览器和服务可以在不同机器上。授权请求不是 SDK–CLI 控制 RPC；模型请求才经 stdio RPC 发给 CLI。参数与端点见 [OAuth / redb 协议说明](docs/oauth-redb.md)。
+服务端所有发往 Anthropic 的请求都由 Claude Code CLI 执行。Rust 只通过 stdin/stdout 的控制 RPC 驱动 CLI，不实现 OAuth HTTP、不硬编码 client ID、不生成 PKCE verifier，也不直接请求 token、profile 或 Console API key 端点。详细信封见 [OAuth RPC / redb 协议说明](docs/oauth-redb.md)。
 
-redb 的 `oauth_credentials_v1` 表存储当前账号的 access token、refresh token、有效期、scope 和账号元数据；Console 模式需要时生成的 API key 也存在同一条记录中。写入使用事务。请求开始前，若 OAuth token 在五分钟内到期，服务串行刷新并持久化轮换后的 refresh token，随后才启动 CLI。管理令牌和网关密钥仍由服务环境变量配置。
+登录使用 `claude_authenticate` 获取 CLI 生成的官方授权 URL；提交授权码时调用 `claude_oauth_callback`，由 CLI 完成 PKCE 校验、token 交换、账号查询、组织策略校验和原生凭据保存。`claude_oauth_callback` 的应答已经等待整个登录流程完成；自动回调场景可用 `claude_oauth_wait_for_completion`，本控制台采用手动授权码方式。当前 CLI 的账号认证 RPC 只接收 `loginWithClaudeAi`，所以本地表单不再传入邮箱或 SSO 参数。
 
-CLI 只接收当次请求需要的 access token 或 Console API key，refresh token 不传给子进程。每次请求使用独立临时 CLI 配置目录；桥接器不把 OAuth 凭据导出到 JSON 凭据文件或系统 keychain，也不会把 token 返回前端。redb 文件目前没有额外加密，依靠本地文件权限保护；移除记录不承诺对数据库空闲页做安全擦除。
+redb 的 `oauth_credentials_v1` 表保存账号凭据、CLI 原生 token 字段和必要的账号配置。已有版本的记录可直接读取，并在运行时转为 CLI 原生格式。授权码、state 和尚未完成的授权会话仅在内存中，重启后需要重新发起授权。
 
-开始登录时需要没有正在运行的模型请求；授权进行期间暂停接收新模型请求。取消、超时或登录失败保留原账号；成功后事务替换。退出只删除本地凭据记录，不会撤销供应商侧的授权或 Console API key。账号状态显示本地记录，不代表已经在线验证授权仍有效。
+CLI 需要原生凭据存储才能自主刷新 token。服务为当前账号创建权限 `0700` 的临时工作目录，凭据文件权限为 `0600`；从 redb 恢复该目录，并在 CLI 初始化、模型响应完成及请求清理时把 CLI 写出的轮换凭据保存回 redb。并发 CLI 共享这个认证缓存，使用 CLI 自带的跨进程刷新锁和 token 比较更新，避免复制旧 refresh token 后重复刷新。每个模型请求仍有独立的工作目录与会话。
+
+macOS 的 CLI 原生调用 `security` 存取凭据；本项目通过仅对子进程生效的私有 PATH 适配器，将这两类凭据服务映射到临时文件，不访问用户的系统 keychain。该适配器只做本地存储，不实现 OAuth 或网络请求；需要 Python 3。Linux 使用 CLI 原生凭据文件。持久化来源为 redb；正常退出和账号退出会清理临时缓存，强制杀死整个服务或系统崩溃可能遗留临时文件，且无法保证尚未同步的刷新结果已写入 redb。redb 本身没有额外静态加密。
+
+开始登录时需要没有正在运行的模型请求；授权期间暂停接收新的模型请求。取消、超时或登录失败保留原账号；成功后事务替换。退出清除本地 redb 记录和临时缓存，不向 Anthropic 发送撤销请求。账号状态展示最近一次 CLI 返回并保存的元数据，不表示实时在线验证。管理令牌和网关密钥仍通过服务环境变量配置；OAuth token 不返回浏览器。
 
 管理接口统一使用 `Authorization: Bearer <BRIDGE_ADMIN_TOKEN>`，响应设置 `Cache-Control: no-store`，只返回白名单账号信息。前端令牌只在当前页面内存保存，不进入 localStorage、sessionStorage、cookie 或 URL，刷新页面需要重新解锁。
 
 | 接口 | 用途 |
 |---|---|
 | `GET /api/admin/status` | 账号、服务状态及当前登录会话 |
-| `POST /api/admin/oauth/start` | `{ "method": "claudeai"或"console", "email": "可选", "sso": false }`；返回登录 ID 和官方授权链接 |
+| `POST /api/admin/oauth/start` | `{ "method": "claudeai" }` 或 `{ "method": "console" }`；返回登录 ID 和官方授权链接 |
 | `GET /api/admin/oauth` | 查询当前授权进度 |
-| `POST /api/admin/oauth/{id}/code` | `{ "code": "code#state" }`；校验 state 后在服务端交换凭据 |
+| `POST /api/admin/oauth/{id}/code` | `{ "code": "code#state" }`；校验 state 后调用 CLI 的 `claude_oauth_callback` |
 | `DELETE /api/admin/oauth/{id}` | 取消当前授权 |
 | `POST /api/admin/logout` | 清除 redb 中的当前账号 |
 
@@ -156,7 +160,10 @@ BRIDGE_API_KEY=your-bridge-key python3 examples/tool_roundtrip.py
 | `src/response.rs` | 内容增量、tool JSON、thinking、usage 重组与流完整性校验 |
 | `src/config.rs` | 服务环境变量 |
 | `src/admin.rs` | 管理鉴权、OAuth 会话状态、账号操作与模型请求互斥 |
-| `src/oauth.rs` | PKCE、授权码交换、Console key、token 自动刷新 |
+| `src/oauth.rs` | CLI 认证 RPC 编排、redb 与临时缓存同步 |
+| `src/control.rs` | 账号管理所用的 stdio 控制 RPC 客户端 |
+| `src/credential_cache.rs` | CLI 原生凭据恢复、读取与临时缓存生命周期 |
+| `scripts/credential-store.py` | macOS 子进程的私有凭据存储适配器 |
 | `src/store.rs` | redb 凭据事务与公开账号信息过滤 |
 | `web/src/` | React 控制台、授权表单、API 接入说明 |
 
@@ -183,7 +190,7 @@ BRIDGE_API_KEY=your-bridge-key python3 examples/tool_roundtrip.py
 
 请求体上限 32 MiB，单个 CLI 帧上限 16 MiB，输出事件累计上限 32 MiB。管理请求体上限 8 KiB。CLI 的本地工具、普通配置来源、自动压缩、hooks、CLAUDE.md、自动记忆、自动文件附件、Chrome 和外部 MCP 配置均在启动时关闭。CLI 的组织策略及模型权限仍由上游处理。
 
-客户端断开或请求超时会取消并回收子进程；SIGINT/SIGTERM 取消正在执行的请求。请求临时目录随请求清理，启用 `--no-session-persistence`。CLI 自身可能仍写入全局诊断或认证状态，这不等同于整个 CLI 不产生任何磁盘写入。
+客户端断开或请求超时会取消并回收子进程；SIGINT/SIGTERM 取消正在执行的请求。请求临时目录随请求清理，启用 `--no-session-persistence`。管理模式下，CLI 的原生认证文件和诊断文件写入私有临时缓存；继承本机 CLI 登录的非管理模式仍可能写入其全局目录。
 
 | 情况 | HTTP / SSE |
 |---|---|
@@ -206,6 +213,7 @@ cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 python3 tests/real_cli_smoke.py --cli "$HOME/.local/bin/claude"
+python3 tests/real_auth_rpc_smoke.py --cli "$HOME/.local/bin/claude"
 REAL_CLAUDE_CLI="$HOME/.local/bin/claude" cargo test --locked --test real_oauth_cli -- --ignored
 cargo build --locked
 npm ci --prefix web
@@ -216,9 +224,11 @@ npm test
 # 已安装 Google Chrome 时可改用：PLAYWRIGHT_CHANNEL=chrome npm test
 ```
 
-Rust 测试使用假 CLI 与本地 OAuth 服务，覆盖 RPC 信封、工具往返、JSON/SSE、usage、thinking 签名、错误、超时、超大帧、鉴权、并发和断开连接后的进程回收，以及 PKCE/state、授权码单次提交、redb 重启恢复、权限、事务替换、取消与超时、刷新互斥、Console key、退出清除和凭据不泄露。Playwright 检查真实管理路由、OAuth 表单、令牌驻留范围、成功账号展示及桌面/手机布局。
+Rust 测试使用假 CLI，覆盖 RPC 信封、工具往返、JSON/SSE、usage、thinking 签名、错误、超时、超大帧、鉴权、并发和断开连接后的进程回收，以及账号认证 RPC 顺序、state 校验、单次授权码、redb 重启恢复、刷新写回、取消与超时、Console key、退出清除和错误脱敏。Playwright 检查管理路由、授权表单、令牌驻留范围、账号展示及桌面/手机布局。
 
-`real_oauth_cli` 验证真实 CLI 使用 redb 中的 dummy OAuth token，refresh token 留在服务端，推理 HTTP 请求只发往本地假 API。这些测试没有执行真实账号授权。
+`real_auth_rpc_smoke.py` 使用真实 CLI 和本地 HTTPS 测试服务，临时 CA 仅注入测试子进程。代理终止 TLS 后直接生成模拟响应，绝不转发请求到外网。它验证 CLI 原生 OAuth RPC、PKCE、账号查询、刷新、Console API key、模型请求，以及 redb 重启恢复；需要本机 `openssl` 命令，不使用真实账号。
+
+`real_oauth_cli` 单独验证真实 CLI 使用由 redb 恢复的原生凭据，推理 HTTP 请求只发往本地假 API。以上测试没有执行真实账号授权。
 
 `real_cli_smoke.py` 使用**真实 CLI + 本机假 Anthropic HTTP 服务**，隔离 HOME/配置并使用 dummy API key，不调用云端模型。它检查结构化历史、max_tokens、SSE、MCP 注册、并行工具、tool_result 恢复、错误工具结果、附带文本与 tool_choice none，同时断言没有多余的 agent 模型轮次。它不验证实际账号登录、模型权限或云端模型质量。
 
