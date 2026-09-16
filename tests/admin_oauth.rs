@@ -85,7 +85,7 @@ fn credential() -> Credential {
         organization: None,
         subscription: None,
         native_credentials: Value::Null,
-        native_config: Value::Null,
+        native_config: json!({"oauthAccount":{"accountUuid":"fixture-id","emailAddress":"saved@example.com"}}),
     }
 }
 fn code(login: &Value, value: &str) -> Value {
@@ -392,5 +392,226 @@ async fn unsupported_login_options_are_rejected_instead_of_implemented_in_rust()
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+}
+
+async fn login_with(app: &Router, state: &AppState, value: &str) -> Value {
+    let (status, login) = call(app, "POST", "/api/admin/oauth/start", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{login}");
+    assert_eq!(
+        call(app, "POST", &callback(&login), code(&login, value))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let result = terminal(app).await;
+    idle(state).await;
+    result
+}
+
+#[tokio::test]
+async fn instance_binding_rejects_other_accounts_even_after_logout_and_restart() {
+    let d = tempfile::tempdir().unwrap();
+    let first = state(d.path());
+    let app = router(first.clone());
+    assert_eq!(first.oauth.status().unwrap()["binding"], Value::Null);
+    assert_eq!(
+        login_with(&app, &first, "missing-identity").await["status"],
+        "failed"
+    );
+    assert_eq!(first.oauth.status().unwrap()["binding"], Value::Null);
+    assert!(first.oauth.credentials().unwrap().load().unwrap().is_none());
+
+    assert_eq!(login_with(&app, &first, "ok").await["status"], "succeeded");
+    let original = first.oauth.inference_cache().await.unwrap().unwrap();
+    // The other account deliberately has the same email: the native UUID wins.
+    let failed = login_with(&app, &first, "other").await;
+    assert_eq!(failed["status"], "failed");
+    assert!(
+        failed["message"]
+            .as_str()
+            .unwrap()
+            .contains("bound to another account")
+    );
+    let active = first.oauth.inference_cache().await.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&original, &active));
+    assert_eq!(
+        first.oauth.status().unwrap()["binding"]["account_id"],
+        "fixture-id"
+    );
+    assert_eq!(
+        first
+            .oauth
+            .credentials()
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap()
+            .access_token,
+        "secret-access"
+    );
+    drop(active);
+    drop(original);
+
+    assert_eq!(
+        call(&app, "POST", "/api/admin/logout", json!({})).await.0,
+        StatusCode::OK
+    );
+    assert!(
+        !first.oauth.status().unwrap()["logged_in"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(
+        first.oauth.status().unwrap()["binding"]["account_id"],
+        "fixture-id"
+    );
+    drop(app);
+    drop(first);
+    let restarted = state(d.path());
+    let app = router(restarted.clone());
+    assert_eq!(
+        login_with(&app, &restarted, "other").await["status"],
+        "failed"
+    );
+    assert!(
+        restarted
+            .oauth
+            .credentials()
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_none()
+    );
+    assert!(restarted.oauth.inference_cache().await.is_err());
+    assert_eq!(
+        login_with(&app, &restarted, "ok").await["status"],
+        "succeeded"
+    );
+    let before = restarted.oauth.inference_cache().await.unwrap().unwrap();
+    assert_eq!(
+        login_with(&app, &restarted, "ok").await["status"],
+        "succeeded"
+    );
+    let after = restarted.oauth.inference_cache().await.unwrap().unwrap();
+    assert!(!Arc::ptr_eq(&before, &after));
+
+    // Another instance has independent credentials and its own binding.
+    let second_dir = tempfile::tempdir().unwrap();
+    let second = state(second_dir.path());
+    assert_eq!(
+        login_with(&router(second.clone()), &second, "other").await["status"],
+        "succeeded"
+    );
+    assert_eq!(
+        second.oauth.status().unwrap()["binding"]["account_id"],
+        "other-id"
+    );
+    assert_eq!(
+        restarted.oauth.status().unwrap()["binding"]["account_id"],
+        "fixture-id"
+    );
+    assert_ne!(
+        second
+            .oauth
+            .inference_cache()
+            .await
+            .unwrap()
+            .unwrap()
+            .path(),
+        after.path()
+    );
+}
+
+#[test]
+fn binding_and_credentials_commit_atomically_and_refresh_cannot_switch_identity() {
+    let d = tempfile::tempdir().unwrap();
+    let store = CredentialStore::open(&d.path().join("creds.redb")).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let handles: Vec<_> = ["account-a", "account-b"]
+        .into_iter()
+        .map(|id| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut c = credential();
+                c.native_config["oauthAccount"]["accountUuid"] = json!(id);
+                barrier.wait();
+                store.save(&c).is_ok()
+            })
+        })
+        .collect();
+    assert_eq!(
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap().then_some(()))
+            .count(),
+        1
+    );
+    let mut saved = store.load().unwrap().unwrap();
+    assert_eq!(
+        store.status().unwrap()["binding"]["account_id"],
+        saved.account_id().unwrap()
+    );
+    // Email changes and credential rotation are allowed for the same native ID.
+    saved.email = Some("renamed@example.com".into());
+    saved.access_token = "rotated-for-same-account".into();
+    store.save(&saved).unwrap();
+    let stable_id = saved.account_id().unwrap().to_owned();
+    saved.native_config["oauthAccount"]["accountUuid"] = json!("other");
+    assert_eq!(store.save(&saved).unwrap_err().status, StatusCode::CONFLICT);
+    saved.native_config = Value::Null;
+    assert_eq!(store.save(&saved).unwrap_err().status, StatusCode::CONFLICT);
+    assert_eq!(
+        store.load().unwrap().unwrap().access_token,
+        "rotated-for-same-account"
+    );
+    assert_eq!(store.status().unwrap()["binding"]["account_id"], stable_id);
+}
+
+#[test]
+fn old_databases_are_bound_before_logout_and_legacy_email_can_upgrade_once() {
+    for has_native_id in [true, false] {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("legacy.redb");
+        let mut c = credential();
+        if !has_native_id {
+            c.native_config = Value::Null;
+        }
+        // Seed an actual pre-binding database, bypassing the new save path.
+        let db = redb::Database::create(&path).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                    "oauth_credentials_v1",
+                ))
+                .unwrap();
+            table
+                .insert("active", serde_json::to_vec(&c).unwrap().as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+        drop(db);
+        let store = CredentialStore::open(&path).unwrap();
+        assert_eq!(
+            store.status().unwrap()["binding"]["email"],
+            "saved@example.com"
+        );
+        store.clear().unwrap();
+        drop(store);
+        let store = CredentialStore::open(&path).unwrap();
+        let mut other = credential();
+        other.email = Some("other@example.com".into());
+        other.native_config["oauthAccount"]["accountUuid"] = json!("other");
+        assert_eq!(store.save(&other).unwrap_err().status, StatusCode::CONFLICT);
+        store.save(&credential()).unwrap();
+        assert_eq!(
+            store.status().unwrap()["binding"]["account_id"],
+            "fixture-id"
+        );
+        // After migration even matching email cannot change the pinned UUID.
+        other.email = Some("saved@example.com".into());
+        assert_eq!(store.save(&other).unwrap_err().status, StatusCode::CONFLICT);
     }
 }

@@ -89,8 +89,15 @@ impl OAuthClient {
         let response=auth.client.call(json!({"subtype":"claude_oauth_callback","authorizationCode":code,"state":auth.state})).await?;
         // This RPC itself awaits the CLI's flow, including token storage and policy
         // checks. Do not send wait_for_completion after the completed flow is gone.
-        auth.cache
-            .capture(None, &auth.method, response.get("account"))
+        let credential = auth
+            .cache
+            .capture(None, &auth.method, response.get("account"))?;
+        if credential.account_id().is_none() {
+            return Err(ApiError::upstream(
+                "CLI did not provide an account identity; credentials were not saved",
+            ));
+        }
+        Ok(credential)
     }
     pub async fn commit(
         &self,
@@ -103,7 +110,7 @@ impl OAuthClient {
         Ok(())
     }
     pub fn status(&self) -> Result<Value> {
-        Ok(self.credentials()?.load()?.map(|c|c.public_view()).unwrap_or_else(||json!({"logged_in":false,"method":null,"provider":"anthropic","email":null,"organization":null,"subscription":null,"storage":"redb"})))
+        self.credentials()?.status()
     }
     pub async fn inference_cache(&self) -> Result<Option<Arc<CredentialCache>>> {
         let Some(store) = &self.store else {

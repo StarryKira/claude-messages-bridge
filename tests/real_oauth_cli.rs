@@ -70,7 +70,7 @@ async fn real_cli_uses_access_token_from_redb() {
             organization: None,
             subscription: None,
             native_credentials: Value::Null,
-            native_config: Value::Null,
+            native_config: json!({"oauthAccount":{"accountUuid":"11111111-1111-4111-8111-111111111111","emailAddress":"test@example.com"}}),
         })
         .unwrap();
     let app = router(state);

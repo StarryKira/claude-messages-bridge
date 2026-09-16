@@ -221,7 +221,7 @@ async fn start_login(
             let code = rx.recv().await.ok_or_else(|| conflict("Login cancelled"))?;
             let credential = state.oauth.complete(&mut auth, &code).await?;
             // Serialize cancellation with the redb commit so a cancelled response
-            // cannot race a successfully replaced account.
+            // cannot race successfully committed credentials for the bound account.
             let mut operation = admin.operation.lock().await;
             if cancel.is_cancelled() {
                 return Err(conflict("Login cancelled"));

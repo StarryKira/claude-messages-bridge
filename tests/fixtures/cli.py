@@ -55,7 +55,9 @@ if user.get('type')=='control_request' and user['request']['subtype']=='claude_a
         cache=Path(os.environ['CLAUDE_CONFIG_DIR'])
         if code=='console':(cache/'.console-key').write_text('secret-console-key')
         else:(cache/'.credentials.json').write_text(json.dumps({'claudeAiOauth':{'accessToken':'secret-access','refreshToken':'secret-refresh','expiresAt':int(time.time()*1000)+3600000,'scopes':['user:inference','user:profile'],'subscriptionType':'pro','rateLimitTier':'default','clientId':'cli-owned-public-client'}}))
-        (cache/'.claude.json').write_text(json.dumps({'oauthAccount':{'emailAddress':'sample@example.com','accountUuid':'fixture-id'},'userID':'cli-generated-device-id'}))
+        account={'emailAddress':'sample@example.com','accountUuid':'other-id' if code=='other' else 'fixture-id'}
+        if code=='missing-identity':account.pop('accountUuid')
+        (cache/'.claude.json').write_text(json.dumps({'oauthAccount':account,'userID':'cli-generated-device-id'}))
         emit({'type':'control_response','response':{'subtype':'success','request_id':callback['request_id'],'response':{'account':{'email':'sample@example.com','organization':'Example Org','subscriptionType':'pro'}}}})
     while sys.stdin.readline():pass
     sys.exit(0)

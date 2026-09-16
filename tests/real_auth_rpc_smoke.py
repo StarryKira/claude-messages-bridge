@@ -27,6 +27,9 @@ seen = []
 access = 'sk-ant-oat01-local-rpc-access'
 refreshed = 'sk-ant-oat01-local-rpc-refreshed'
 console_key = 'sk-ant-api03-local-rpc-console-key'
+account_id = '11111111-1111-4111-8111-111111111111'
+other_id = '33333333-3333-4333-8333-333333333333'
+other_access = 'sk-ant-oat01-local-rpc-other'
 
 
 def response_events():
@@ -70,10 +73,10 @@ with tempfile.TemporaryDirectory(prefix='bridge-real-auth-rpc-') as directory:
                 is_refresh=payload['grant_type']=='refresh_token'
                 if not is_refresh:
                     assert payload['code_verifier'] and payload['state']
-                    assert payload['code'] in ('ok','console')
-                self.reply({'access_token':refreshed if is_refresh else access,'refresh_token':'dummy-rotated-refresh' if is_refresh else 'dummy-cli-refresh','expires_in':3600 if is_refresh else 1,'scope':'org:create_api_key user:profile' if payload.get('code')=='console' else 'user:inference user:profile','account':{'uuid':'11111111-1111-4111-8111-111111111111','email_address':'rpc-test@example.com'},'organization':{'uuid':'22222222-2222-4222-8222-222222222222'}})
+                    assert payload['code'] in ('ok','console','other')
+                self.reply({'access_token':refreshed if is_refresh else other_access if payload.get('code')=='other' else access,'refresh_token':'dummy-rotated-refresh' if is_refresh else 'dummy-cli-refresh','expires_in':3600 if is_refresh else 1,'scope':'org:create_api_key user:profile' if payload.get('code')=='console' else 'user:inference user:profile','account':{'uuid':other_id if payload.get('code')=='other' else account_id,'email_address':'rpc-test@example.com'},'organization':{'uuid':'22222222-2222-4222-8222-222222222222'}})
             elif path=='/api/oauth/profile':
-                self.reply({'account':{'uuid':'11111111-1111-4111-8111-111111111111','email':'rpc-test@example.com','display_name':'RPC Test','created_at':'2025-01-01T00:00:00Z'},'organization':{'uuid':'22222222-2222-4222-8222-222222222222','name':'Local Fixture','organization_type':'claude_pro','rate_limit_tier':'default_claude_pro','billing_type':'stripe','has_extra_usage_enabled':False,'subscription_created_at':'2025-01-01T00:00:00Z'}})
+                self.reply({'account':{'uuid':other_id if self.headers.get('Authorization')=='Bearer '+other_access else account_id,'email':'rpc-test@example.com','display_name':'RPC Test','created_at':'2025-01-01T00:00:00Z'},'organization':{'uuid':'22222222-2222-4222-8222-222222222222','name':'Local Fixture','organization_type':'claude_pro','rate_limit_tier':'default_claude_pro','billing_type':'stripe','has_extra_usage_enabled':False,'subscription_created_at':'2025-01-01T00:00:00Z'}})
             elif path=='/api/oauth/claude_cli/create_api_key': self.reply({'raw_key':console_key})
             elif path=='/api/oauth/claude_cli/roles': self.reply({'organization_role':'admin','workspace_role':'admin'})
             elif path=='/v1/messages':
@@ -110,7 +113,7 @@ with tempfile.TemporaryDirectory(prefix='bridge-real-auth-rpc-') as directory:
         try:child.wait(timeout=5)
         except subprocess.TimeoutExpired:child.kill();child.wait()
         child.stderr.close()
-    def login(method,code):
+    def login(method,code,expected="succeeded"):
         session=api('/api/admin/oauth/start',{'method':method})
         parsed=urlsplit(session['authorization_url']);query=parse_qs(parsed.query)
         assert query['code_challenge_method']==['S256']
@@ -119,19 +122,22 @@ with tempfile.TemporaryDirectory(prefix='bridge-real-auth-rpc-') as directory:
         while time.monotonic()<deadline:
             current=api('/api/admin/oauth')['login']
             if current['status'] not in ('waiting','submitting','starting'):
-                assert current['status']=='succeeded',current
+                assert current['status']==expected,current
                 break
             time.sleep(.1)
         else:raise AssertionError('Login timed out')
         # Completion is published after the CLI's native writes. Wait for child reaping.
         while api('/api/admin/status')['service']['available_slots']==0:time.sleep(.05)
-        assert api('/api/admin/status')['account']['logged_in']
+        if expected=='succeeded':assert api('/api/admin/status')['account']['logged_in']
+        else:assert 'bound to another account' in current['message']
     def message():
         result=api('/v1/messages',{'model':'claude-sonnet-4-6','max_tokens':128,'messages':[{'role':'user','content':'hello'}]})
         assert result['content'][0]['text']=='native OAuth RPC works'
         while api('/api/admin/status')['service']['available_slots']<4:time.sleep(.05)
     try:
         launch();login('claudeai','ok');print('PASS real CLI native authenticate/callback RPC, PKCE, profile and redb save',flush=True)
+        assert api('/api/admin/status')['account']['binding']['account_id']==account_id
+        login('claudeai','other',expected='failed')
         message()
         refreshes=sum(path=='/v1/oauth/token' and payload.get('grant_type')=='refresh_token' for path,payload,_ in seen)
         assert refreshes>=1
@@ -139,7 +145,13 @@ with tempfile.TemporaryDirectory(prefix='bridge-real-auth-rpc-') as directory:
         stop();launch();message()
         assert sum(path=='/v1/oauth/token' and payload.get('grant_type')=='refresh_token' for path,payload,_ in seen)==refreshes
         print('PASS redb restart restores rotated native credentials',flush=True)
-        api('/api/admin/logout',{});login('console','console');message()
+        api('/api/admin/logout',{})
+        stop();launch()
+        assert api('/api/admin/status')['account']['binding']['account_id']==account_id
+        login('claudeai','other',expected='failed')
+        assert not api('/api/admin/status')['account']['logged_in']
+        print('PASS native account UUID binding survives logout/restart and rejects other accounts',flush=True)
+        login('console','console');message()
         assert any(path=='/api/oauth/claude_cli/create_api_key' for path,_,_ in seen)
         print('PASS Console account RPC, native API key creation and inference',flush=True)
         api('/api/admin/logout',{})

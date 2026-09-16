@@ -29,7 +29,7 @@ bash scripts/run-console.sh
 
 初始化脚本生成 `.env`（权限 `0600`）中的随机 `BRIDGE_ADMIN_TOKEN` 和独立的 `BRIDGE_API_KEY`，不会覆盖已有配置或打印密钥。启动脚本加载 `.env`，数据库位于 `.bridge/credentials.redb`；数据库文件权限为 `0600`，运行目录为 `0700`。
 
-打开 [Web 控制台](http://127.0.0.1:8787/admin/)，使用 `.env` 中的 `BRIDGE_ADMIN_TOKEN` 解锁，点击「开始 OAuth 登录」。在 Claude 官方页面完成授权，将页面提供的完整 `code#state` 粘贴回控制台。可以选择 Claude 订阅或 Anthropic Console；邮箱和企业 SSO 在官方页面选择。凭据保存在服务器的 redb 中，重启服务后仍然可用。当前管理一个服务账号，新账号成功登录后替换旧账号。
+打开 [Web 控制台](http://127.0.0.1:8787/admin/)，使用 `.env` 中的 `BRIDGE_ADMIN_TOKEN` 解锁，点击「开始 OAuth 登录」。在 Claude 官方页面完成授权，将页面提供的完整 `code#state` 粘贴回控制台。可以选择 Claude 订阅或 Anthropic Console；邮箱和企业 SSO 在官方页面选择。凭据保存在服务器的 redb 中，重启服务后仍然可用。每个实例只负责一个账号：首次成功登录后固定绑定 CLI 返回的账号 UUID，以后仅接受同账号重新授权。退出和重启都保留绑定；登录其他账号会失败，并保留原凭据。
 
 默认监听 `127.0.0.1:8787`。`GET /healthz` 仅检查服务存活，不检查 CLI 登录或模型权限。示例请求需要先加载网关密钥：
 
@@ -63,30 +63,54 @@ print(message.content)
 
 仅使用原来的 CLI 认证环境时，可不设置 `BRIDGE_ADMIN_TOKEN` 和 `BRIDGE_CREDENTIAL_DB`，直接运行二进制。此时关闭管理接口，继续继承 CLI 已有登录或服务端 API key。直接运行二进制不会自动加载 `.env`。
 
+## 一个实例，一个账号
+
+实例以自己的 redb 文件保存账号绑定，不提供账号列表、切换或轮询。`BRIDGE_MAX_CONCURRENCY` 控制同一账号的并发请求数，不代表账号数。多个实例可以复用同一个 CLI 二进制和前端构建，各自拥有独立的认证缓存和凭据。
+
+| 配置 | 实例 A | 实例 B |
+|---|---|---|
+| `BRIDGE_BIND` | `127.0.0.1:8787` | `127.0.0.1:8788` |
+| `BRIDGE_CREDENTIAL_DB` | `.bridge/account-a.redb` | `.bridge/account-b.redb` |
+| `BRIDGE_ADMIN_TOKEN` | A 的独立管理令牌 | B 的独立管理令牌 |
+| `BRIDGE_API_KEY` | A 的独立调用密钥 | B 的独立调用密钥 |
+
+分别把配置写入私有的 `.env.account-a` 和 `.env.account-b`，在两个终端加载对应文件并直接启动同一个二进制：
+
+```sh
+set -a
+source .env.account-a  # 另一个终端使用 .env.account-b
+set +a
+./target/release/claude-messages-bridge
+```
+
+令牌分别生成，管理令牌至少 32 字节且不能与调用密钥相同。配置文件权限设为 `0600`。分别打开两个端口的 `/admin/`，登录各自的账号。redb 有独占锁，两个进程不能共用同一数据库。退出只删除登录凭据，不解除绑定；另一个账号请使用新的实例配置和数据库，不覆盖原库。
+
+以上固定绑定由 redb 模式执行；前述继承本机 CLI 的兼容模式没有 redb 绑定校验，须使用专属 CLI 认证环境。Web 控制台默认使用 redb 模式。
+
 ## OAuth 与 redb
 
 服务端所有发往 Anthropic 的请求都由 Claude Code CLI 执行。Rust 只通过 stdin/stdout 的控制 RPC 驱动 CLI，不实现 OAuth HTTP、不硬编码 client ID、不生成 PKCE verifier，也不直接请求 token、profile 或 Console API key 端点。详细信封见 [OAuth RPC / redb 协议说明](docs/oauth-redb.md)。
 
 登录使用 `claude_authenticate` 获取 CLI 生成的官方授权 URL；提交授权码时调用 `claude_oauth_callback`，由 CLI 完成 PKCE 校验、token 交换、账号查询、组织策略校验和原生凭据保存。`claude_oauth_callback` 的应答已经等待整个登录流程完成；自动回调场景可用 `claude_oauth_wait_for_completion`，本控制台采用手动授权码方式。当前 CLI 的账号认证 RPC 只接收 `loginWithClaudeAi`，所以本地表单不再传入邮箱或 SSO 参数。
 
-redb 的 `oauth_credentials_v1` 表保存账号凭据、CLI 原生 token 字段和必要的账号配置。已有版本的记录可直接读取，并在运行时转为 CLI 原生格式。授权码、state 和尚未完成的授权会话仅在内存中，重启后需要重新发起授权。
+redb 的 `oauth_credentials_v1` 表以 `active` 保存账号凭据、CLI 原生 token 字段和必要的账号配置，以 `binding` 保存实例绑定身份。已有版本的记录可直接读取，并在运行时转为 CLI 原生格式。授权码、state 和尚未完成的授权会话仅在内存中，重启后需要重新发起授权。
 
 CLI 需要原生凭据存储才能自主刷新 token。服务为当前账号创建权限 `0700` 的临时工作目录，凭据文件权限为 `0600`；从 redb 恢复该目录，并在 CLI 初始化、模型响应完成及请求清理时把 CLI 写出的轮换凭据保存回 redb。并发 CLI 共享这个认证缓存，使用 CLI 自带的跨进程刷新锁和 token 比较更新，避免复制旧 refresh token 后重复刷新。每个模型请求仍有独立的工作目录与会话。
 
 macOS 的 CLI 原生调用 `security` 存取凭据；本项目通过仅对子进程生效的私有 PATH 适配器，将这两类凭据服务映射到临时文件，不访问用户的系统 keychain。该适配器只做本地存储，不实现 OAuth 或网络请求；需要 Python 3。Linux 使用 CLI 原生凭据文件。持久化来源为 redb；正常退出和账号退出会清理临时缓存，强制杀死整个服务或系统崩溃可能遗留临时文件，且无法保证尚未同步的刷新结果已写入 redb。redb 本身没有额外静态加密。
 
-开始登录时需要没有正在运行的模型请求；授权期间暂停接收新的模型请求。取消、超时或登录失败保留原账号；成功后事务替换。退出清除本地 redb 记录和临时缓存，不向 Anthropic 发送撤销请求。账号状态展示最近一次 CLI 返回并保存的元数据，不表示实时在线验证。管理令牌和网关密钥仍通过服务环境变量配置；OAuth token 不返回浏览器。
+开始登录时需要没有正在运行的模型请求；授权期间暂停接收新的模型请求。取消、超时、登录失败或账号 UUID 不匹配时保留原凭据；同账号重新授权成功后在一个事务中更新凭据。退出清除 redb 的 `active` 凭据记录和临时缓存，保留 `binding` 账号身份，不向 Anthropic 发送撤销请求。账号状态展示最近一次 CLI 返回并保存的元数据，不表示实时在线验证。管理令牌和网关密钥仍通过服务环境变量配置；OAuth token 不返回浏览器。
 
 管理接口统一使用 `Authorization: Bearer <BRIDGE_ADMIN_TOKEN>`，响应设置 `Cache-Control: no-store`，只返回白名单账号信息。前端令牌只在当前页面内存保存，不进入 localStorage、sessionStorage、cookie 或 URL，刷新页面需要重新解锁。
 
 | 接口 | 用途 |
 |---|---|
-| `GET /api/admin/status` | 账号、服务状态及当前登录会话 |
+| `GET /api/admin/status` | 账号、实例绑定、服务状态及当前登录会话；`account.binding` 在未绑定时为 null，绑定后含 `account_id` 和 `email` |
 | `POST /api/admin/oauth/start` | `{ "method": "claudeai" }` 或 `{ "method": "console" }`；返回登录 ID 和官方授权链接 |
 | `GET /api/admin/oauth` | 查询当前授权进度 |
 | `POST /api/admin/oauth/{id}/code` | `{ "code": "code#state" }`；校验 state 后调用 CLI 的 `claude_oauth_callback` |
 | `DELETE /api/admin/oauth/{id}` | 取消当前授权 |
-| `POST /api/admin/logout` | 清除 redb 中的当前账号 |
+| `POST /api/admin/logout` | 清除当前凭据并保留实例账号绑定 |
 
 前端开发：先运行后端，再执行 `npm run dev --prefix web`，打开 `http://127.0.0.1:5173/admin/`；Vite 将 `/api` 请求代理到 `127.0.0.1:8787`。生产静态文件由 Axum 同源提供。
 
@@ -224,7 +248,7 @@ npm test
 # 已安装 Google Chrome 时可改用：PLAYWRIGHT_CHANNEL=chrome npm test
 ```
 
-Rust 测试使用假 CLI，覆盖 RPC 信封、工具往返、JSON/SSE、usage、thinking 签名、错误、超时、超大帧、鉴权、并发和断开连接后的进程回收，以及账号认证 RPC 顺序、state 校验、单次授权码、redb 重启恢复、刷新写回、取消与超时、Console key、退出清除和错误脱敏。Playwright 检查管理路由、授权表单、令牌驻留范围、账号展示及桌面/手机布局。
+Rust 测试使用假 CLI，覆盖 RPC 信封、工具往返、JSON/SSE、usage、thinking 签名、错误、超时、超大帧、鉴权、并发和断开连接后的进程回收，以及账号认证 RPC 顺序、state 校验、单次授权码、redb 重启恢复、刷新写回、取消与超时、Console key、退出清除、实例永久绑定、旧库迁移、同账号重新授权、跨账号拒绝和多实例隔离，以及错误脱敏。Playwright 检查管理路由、授权表单、令牌驻留范围、账号展示及桌面/手机布局。
 
 `real_auth_rpc_smoke.py` 使用真实 CLI 和本地 HTTPS 测试服务，临时 CA 仅注入测试子进程。代理终止 TLS 后直接生成模拟响应，绝不转发请求到外网。它验证 CLI 原生 OAuth RPC、PKCE、账号查询、刷新、Console API key、模型请求，以及 redb 重启恢复；需要本机 `openssl` 命令，不使用真实账号。
 

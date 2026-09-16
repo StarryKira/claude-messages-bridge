@@ -1,6 +1,6 @@
 export type Login = {id: string; status: 'starting'|'waiting'|'submitting'|'succeeded'|'failed'|'cancelled'|'expired'; authorization_url: string|null; message: string|null; expires_at: string}
 export type Status = {
-  account: {logged_in:boolean; method:string|null; provider:string|null; email:string|null; organization:string|null; subscription:string|null};
+  account: {binding:{account_id:string|null;email:string|null}|null; logged_in:boolean; method:string|null; provider:string|null; email:string|null; organization:string|null; subscription:string|null};
   login: Login|null;
   service: {version:string; bind:string; max_concurrency:number; available_slots:number; api_key_required:boolean; request_timeout_seconds:number; credential_mode:string; messages_path:string};
 }
